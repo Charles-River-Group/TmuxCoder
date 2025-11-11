@@ -1,6 +1,7 @@
 package state
 
 import (
+	"fmt"
 	"log"
 	"sync"
 	"time"
@@ -29,19 +30,34 @@ func NewEventBus(maxHistory int) *EventBus {
 }
 
 // Subscribe registers a panel for state change notifications
-func (bus *EventBus) Subscribe(panelID, panelType string, eventChan chan types.StateEvent) {
+func (bus *EventBus) Subscribe(connectionID, panelID, panelType string, eventChan chan types.StateEvent) {
 	bus.mutex.Lock()
 	defer bus.mutex.Unlock()
 
-	bus.subscribers[panelID] = eventChan
-	bus.subscriberMeta[panelID] = interfaces.SubscriberInfo{
-		PanelID:     panelID,
-		PanelType:   panelType,
-		ConnectedAt: time.Now(),
-		EventCount:  0,
+	// Remove any existing subscriptions for this connection ID
+	bus.removeSubscriberLocked(connectionID, fmt.Sprintf("connection %s re-registered", connectionID))
+
+	// Remove stale subscriptions for the same panel ID to avoid overlap
+	var staleConnections []string
+	for existingConnID, meta := range bus.subscriberMeta {
+		if meta.PanelID == panelID {
+			staleConnections = append(staleConnections, existingConnID)
+		}
+	}
+	for _, staleConnID := range staleConnections {
+		bus.removeSubscriberLocked(staleConnID, fmt.Sprintf("panel %s replaced by connection %s", panelID, connectionID))
 	}
 
-	log.Printf("Panel %s (%s) subscribed to events", panelID, panelType)
+	bus.subscribers[connectionID] = eventChan
+	bus.subscriberMeta[connectionID] = interfaces.SubscriberInfo{
+		ConnectionID: connectionID,
+		PanelID:      panelID,
+		PanelType:    panelType,
+		ConnectedAt:  time.Now(),
+		EventCount:   0,
+	}
+
+	log.Printf("Panel %s (%s) subscribed to events with connection %s", panelID, panelType, connectionID)
 
 	// Notify other panels about new connection
 	connectEvent := types.StateEvent{
@@ -55,31 +71,11 @@ func (bus *EventBus) Subscribe(panelID, panelType string, eventChan chan types.S
 }
 
 // Unsubscribe removes a panel from event notifications
-func (bus *EventBus) Unsubscribe(panelID string) {
+func (bus *EventBus) Unsubscribe(connectionID string) {
 	bus.mutex.Lock()
 	defer bus.mutex.Unlock()
 
-	if eventChan, exists := bus.subscribers[panelID]; exists {
-		// Close the channel to signal shutdown
-		close(eventChan)
-		delete(bus.subscribers, panelID)
-
-		// Get panel info before deleting
-		panelInfo := bus.subscriberMeta[panelID]
-		delete(bus.subscriberMeta, panelID)
-
-		log.Printf("Panel %s (%s) unsubscribed from events", panelID, panelInfo.PanelType)
-
-		// Notify other panels about disconnection
-		disconnectEvent := types.StateEvent{
-			ID:          generateEventID(),
-			Type:        types.EventPanelDisconnected,
-			Data:        types.PanelConnectionPayload{PanelID: panelID, PanelType: panelInfo.PanelType},
-			SourcePanel: "system",
-			Timestamp:   time.Now(),
-		}
-		bus.broadcastUnsafe(disconnectEvent, panelID)
-	}
+	bus.removeSubscriberLocked(connectionID, "")
 }
 
 // Broadcast sends events to all registered panels except the source
@@ -96,47 +92,57 @@ func (bus *EventBus) broadcastUnsafe(event types.StateEvent, excludePanel string
 	bus.addToHistoryUnsafe(event)
 
 	// Send to all subscribers except the source panel
-	for panelID, eventChan := range bus.subscribers {
-		if panelID != excludePanel {
-			// Update subscriber metadata
-			if meta, exists := bus.subscriberMeta[panelID]; exists {
-				meta.LastEventAt = time.Now()
-				meta.EventCount++
-				bus.subscriberMeta[panelID] = meta
-			}
+	for connectionID, eventChan := range bus.subscribers {
+		meta, hasMeta := bus.subscriberMeta[connectionID]
+		if hasMeta && meta.PanelID == excludePanel {
+			continue
+		}
 
-			// Try to send event (non-blocking)
-			select {
-			case eventChan <- event:
-				// Event delivered successfully
-			default:
-				// Channel full, log warning but continue
-				log.Printf("Warning: Event channel full for panel %s, dropping event %s",
-					panelID, event.Type)
+		if hasMeta {
+			meta.LastEventAt = time.Now()
+			meta.EventCount++
+			meta.ConnectionID = connectionID
+			bus.subscriberMeta[connectionID] = meta
+		}
+
+		// Try to send event (non-blocking)
+		select {
+		case eventChan <- event:
+			// Event delivered successfully
+		default:
+			// Channel full, log warning but continue
+			panelLabel := fmt.Sprintf("connection:%s", connectionID)
+			if hasMeta && meta.PanelID != "" {
+				panelLabel = meta.PanelID
 			}
+			log.Printf("Warning: Event channel full for %s (connection %s), dropping event %s",
+				panelLabel, connectionID, event.Type)
 		}
 	}
 }
 
 // BroadcastToPanel sends an event specifically to one panel
 func (bus *EventBus) BroadcastToPanel(event types.StateEvent, targetPanel string) {
-	bus.mutex.RLock()
-	defer bus.mutex.RUnlock()
+	bus.mutex.Lock()
+	defer bus.mutex.Unlock()
 
-	if eventChan, exists := bus.subscribers[targetPanel]; exists {
-		// Update subscriber metadata
-		if meta, exists := bus.subscriberMeta[targetPanel]; exists {
-			meta.LastEventAt = time.Now()
-			meta.EventCount++
-			bus.subscriberMeta[targetPanel] = meta
+	for connectionID, eventChan := range bus.subscribers {
+		meta, exists := bus.subscriberMeta[connectionID]
+		if !exists || meta.PanelID != targetPanel {
+			continue
 		}
+
+		meta.LastEventAt = time.Now()
+		meta.EventCount++
+		meta.ConnectionID = connectionID
+		bus.subscriberMeta[connectionID] = meta
 
 		select {
 		case eventChan <- event:
 			// Event delivered successfully
 		default:
-			log.Printf("Warning: Event channel full for panel %s, dropping targeted event %s",
-				targetPanel, event.Type)
+			log.Printf("Warning: Event channel full for panel %s (connection %s), dropping targeted event %s",
+				targetPanel, connectionID, event.Type)
 		}
 	}
 }
@@ -147,10 +153,56 @@ func (bus *EventBus) GetSubscribers() map[string]interfaces.SubscriberInfo {
 	defer bus.mutex.RUnlock()
 
 	subscribers := make(map[string]interfaces.SubscriberInfo)
-	for panelID, info := range bus.subscriberMeta {
-		subscribers[panelID] = info
+	for connectionID, info := range bus.subscriberMeta {
+		subscribers[connectionID] = info
 	}
 	return subscribers
+}
+
+// removeSubscriberLocked removes a subscriber while holding the bus mutex.
+func (bus *EventBus) removeSubscriberLocked(connectionID string, reason string) {
+	eventChan, exists := bus.subscribers[connectionID]
+	if !exists {
+		return
+	}
+
+	meta, metaExists := bus.subscriberMeta[connectionID]
+	if !metaExists {
+		meta = interfaces.SubscriberInfo{
+			ConnectionID: connectionID,
+		}
+	} else {
+		meta.ConnectionID = connectionID
+	}
+
+	delete(bus.subscribers, connectionID)
+	delete(bus.subscriberMeta, connectionID)
+
+	close(eventChan)
+
+	if meta.PanelID == "" {
+		if reason != "" {
+			log.Printf("Removed event subscription for unidentified connection %s (reason: %s)", connectionID, reason)
+		} else {
+			log.Printf("Removed event subscription for unidentified connection %s", connectionID)
+		}
+		return
+	}
+
+	if reason != "" {
+		log.Printf("Panel %s (%s) unsubscribed from events (connection %s, reason: %s)", meta.PanelID, meta.PanelType, connectionID, reason)
+	} else {
+		log.Printf("Panel %s (%s) unsubscribed from events (connection %s)", meta.PanelID, meta.PanelType, connectionID)
+	}
+
+	disconnectEvent := types.StateEvent{
+		ID:          generateEventID(),
+		Type:        types.EventPanelDisconnected,
+		Data:        types.PanelConnectionPayload{PanelID: meta.PanelID, PanelType: meta.PanelType},
+		SourcePanel: "system",
+		Timestamp:   time.Now(),
+	}
+	bus.broadcastUnsafe(disconnectEvent, meta.PanelID)
 }
 
 // GetEventHistory returns recent events from the history buffer

@@ -240,7 +240,7 @@ func (orch *TmuxOrchestrator) initializeStateManagement() error {
 
 	// Create event channel for local state changes
 	eventChan := make(chan types.StateEvent, 100)
-	eventBus.Subscribe("tmux-orchestrator", "orchestrator", eventChan)
+	eventBus.Subscribe("tmux-orchestrator", "tmux-orchestrator", "orchestrator", eventChan)
 
 	// Start goroutine to handle events
 	go orch.handleEvents(eventChan)

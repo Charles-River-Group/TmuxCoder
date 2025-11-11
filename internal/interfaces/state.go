@@ -60,10 +60,10 @@ type StateManager interface {
 // EventBus defines the interface for event distribution
 type EventBus interface {
 	// Subscribe registers a panel for state change notifications
-	Subscribe(panelID, panelType string, eventChan chan types.StateEvent)
+	Subscribe(connectionID, panelID, panelType string, eventChan chan types.StateEvent)
 
 	// Unsubscribe removes a panel from event notifications
-	Unsubscribe(panelID string)
+	Unsubscribe(connectionID string)
 
 	// Broadcast sends events to all registered panels except the source
 	Broadcast(event types.StateEvent)
@@ -200,11 +200,12 @@ func (m *StateManagerMetrics) GetSaveSuccessRate() float64 {
 
 // SubscriberInfo contains metadata about event subscribers
 type SubscriberInfo struct {
-	PanelID     string    `json:"panel_id"`
-	PanelType   string    `json:"panel_type"`
-	ConnectedAt time.Time `json:"connected_at"`
-	LastEventAt time.Time `json:"last_event_at"`
-	EventCount  int64     `json:"event_count"`
+	ConnectionID string    `json:"connection_id"`
+	PanelID      string    `json:"panel_id"`
+	PanelType    string    `json:"panel_type"`
+	ConnectedAt  time.Time `json:"connected_at"`
+	LastEventAt  time.Time `json:"last_event_at"`
+	EventCount   int64     `json:"event_count"`
 }
 
 // ConflictResolutionResult represents the outcome of conflict resolution

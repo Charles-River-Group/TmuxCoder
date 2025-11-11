@@ -237,7 +237,7 @@ func (server *SocketServer) handleConnection(conn net.Conn) {
 
 	// Subscribe to event bus
 	eventChan := make(chan types.StateEvent, 100)
-	server.eventBus.Subscribe(clientConn.PanelID, clientConn.PanelType, eventChan)
+	server.eventBus.Subscribe(clientConn.ID, clientConn.PanelID, clientConn.PanelType, eventChan)
 
 	// Start event forwarding goroutine
 	go server.forwardEvents(clientConn, eventChan)
@@ -253,7 +253,7 @@ func (server *SocketServer) handleConnection(conn net.Conn) {
 	delete(server.connections, clientConn.ID)
 	server.connectionsMux.Unlock()
 
-	server.eventBus.Unsubscribe(clientConn.PanelID)
+	server.eventBus.Unsubscribe(clientConn.ID)
 	log.Printf("Panel %s (%s) disconnected", clientConn.PanelID, clientConn.PanelType)
 }
 
