@@ -316,6 +316,46 @@ func (client *SocketClient) SendClearSessionMessages(sessionID string) error {
 	return nil
 }
 
+// SendOrchestratorCommand sends a control command to the orchestrator and waits for the result.
+func (client *SocketClient) SendOrchestratorCommand(command string) error {
+	command = strings.TrimSpace(command)
+	if command == "" {
+		return fmt.Errorf("command cannot be empty")
+	}
+
+	message := IPCMessage{
+		Type: "orchestrator_command",
+		Data: map[string]interface{}{
+			"command": command,
+		},
+		Timestamp: time.Now(),
+	}
+
+	response, err := client.sendRequestAndWait(&message, 15*time.Second)
+	if err != nil {
+		return fmt.Errorf("failed to execute orchestrator command: %w", err)
+	}
+
+	if response.Type != "orchestrator_command_response" {
+		return fmt.Errorf("unexpected response type: %s", response.Type)
+	}
+
+	if response.Data == nil {
+		return fmt.Errorf("empty orchestrator response")
+	}
+
+	if respData, ok := response.Data.(map[string]interface{}); ok {
+		if success, ok := respData["success"].(bool); ok && success {
+			return nil
+		}
+		if errMsg, ok := respData["error"].(string); ok && errMsg != "" {
+			return fmt.Errorf(errMsg)
+		}
+	}
+
+	return fmt.Errorf("orchestrator command failed")
+}
+
 // RegisterEventHandler registers a handler for specific event types
 func (client *SocketClient) RegisterEventHandler(eventType types.StateEventType, handler EventHandler) {
 	client.handlerMux.Lock()

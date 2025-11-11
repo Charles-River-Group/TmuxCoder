@@ -14,6 +14,8 @@ Options:
   --skip-build       跳过 Go 构建步骤，直接运行已有二进制
   --server <URL>     设置 OPENCODE_SERVER（默认 http://127.0.0.1:62435）
   --panels <list>    仅构建指定面板，逗号分隔（sessions,messages,input）
+  --attach-only      仅附着到已存在的 tmux 会话，不重启面板
+  --reload-layout    向正在运行的 tmux 会话发送热重布命令
   -h, --help         显示本帮助
 
 其它参数会原样传给 opencode-tmux，可用于添加 --server-only 等标志。
@@ -23,6 +25,8 @@ EOF
 SKIP_BUILD=0
 SERVER_URL="${OPENCODE_SERVER:-http://127.0.0.1:62435}"
 REQUESTED_PANELS=""
+ATTACH_ONLY=0
+RELOAD_LAYOUT=0
 declare -a FORWARD_ARGS=()
 
 while [[ $# -gt 0 ]]; do
@@ -47,6 +51,16 @@ while [[ $# -gt 0 ]]; do
       REQUESTED_PANELS="$2"
       shift 2
       ;;
+    --attach-only)
+      ATTACH_ONLY=1
+      FORWARD_ARGS+=("--attach-only")
+      shift
+      ;;
+    --reload-layout)
+      RELOAD_LAYOUT=1
+      FORWARD_ARGS+=("--reload-layout")
+      shift
+      ;;
     -h|--help)
       usage
       exit 0
@@ -62,6 +76,10 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+if [[ $ATTACH_ONLY -eq 1 || $RELOAD_LAYOUT -eq 1 ]]; then
+  SKIP_BUILD=1
+fi
 
 function ensure_command() {
   local name="$1"
@@ -159,6 +177,18 @@ BIN_PATH="${REPO_ROOT}/cmd/opencode-tmux/dist/opencode-tmux"
 if [[ ! -x "${BIN_PATH}" ]]; then
   echo "错误：未找到可执行文件 ${BIN_PATH}，请不要跳过构建或检查构建是否成功。" >&2
   exit 1
+fi
+
+SESSION_FLAG_PRESENT=0
+for arg in "${FORWARD_ARGS[@]+"${FORWARD_ARGS[@]}"}"; do
+  if [[ "$arg" == "--reuse-session" || "$arg" == "--force-new-session" ]]; then
+    SESSION_FLAG_PRESENT=1
+    break
+  fi
+done
+
+if [[ -n "$REQUESTED_PANELS" && $SESSION_FLAG_PRESENT -eq 0 && $ATTACH_ONLY -eq 0 && $RELOAD_LAYOUT -eq 0 ]]; then
+  FORWARD_ARGS+=("--reuse-session")
 fi
 
 if [[ ${#FORWARD_ARGS[@]} -gt 0 ]]; then

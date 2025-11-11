@@ -16,16 +16,16 @@ type IPCMessage struct {
 
 // HandshakeMessage is sent by clients to initiate connection
 type HandshakeMessage struct {
-	Type      string    `json:"type"`      // Always "handshake"
-	PanelID   string    `json:"panel_id"`  // Unique panel identifier
+	Type      string    `json:"type"`       // Always "handshake"
+	PanelID   string    `json:"panel_id"`   // Unique panel identifier
 	PanelType string    `json:"panel_type"` // "sessions", "messages", "input"
-	Version   string    `json:"version"`   // Protocol version
+	Version   string    `json:"version"`    // Protocol version
 	Timestamp time.Time `json:"timestamp"`
 }
 
 // HandshakeResponse is sent by server in response to handshake
 type HandshakeResponse struct {
-	Type         string    `json:"type"`          // Always "handshake_response"
+	Type         string    `json:"type"` // Always "handshake_response"
 	Success      bool      `json:"success"`
 	ConnectionID string    `json:"connection_id"` // Server-assigned connection ID
 	ServerTime   time.Time `json:"server_time"`
@@ -34,19 +34,19 @@ type HandshakeResponse struct {
 
 // Message type constants
 const (
-	MessageTypeHandshake         = "handshake"
-	MessageTypeHandshakeResponse = "handshake_response"
-	MessageTypeStateUpdate       = "state_update"
+	MessageTypeHandshake           = "handshake"
+	MessageTypeHandshakeResponse   = "handshake_response"
+	MessageTypeStateUpdate         = "state_update"
 	MessageTypeStateUpdateResponse = "state_update_response"
-	MessageTypeStateRequest      = "state_request"
-	MessageTypeStateResponse     = "state_response"
-	MessageTypeStateEvent        = "state_event"
-	MessageTypePing              = "ping"
-	MessageTypePong              = "pong"
-	MessageTypeError             = "error"
-	MessageTypeSubscribe         = "subscribe"
-	MessageTypeUnsubscribe       = "unsubscribe"
-	MessageTypeHeartbeat         = "heartbeat"
+	MessageTypeStateRequest        = "state_request"
+	MessageTypeStateResponse       = "state_response"
+	MessageTypeStateEvent          = "state_event"
+	MessageTypePing                = "ping"
+	MessageTypePong                = "pong"
+	MessageTypeError               = "error"
+	MessageTypeSubscribe           = "subscribe"
+	MessageTypeUnsubscribe         = "unsubscribe"
+	MessageTypeHeartbeat           = "heartbeat"
 )
 
 // SubscribeMessage allows clients to subscribe to specific event types
@@ -77,14 +77,14 @@ type ErrorMessage struct {
 
 // Well-known error codes
 const (
-	ErrorCodeInvalidMessage    = "INVALID_MESSAGE"
-	ErrorCodeAuthFailed        = "AUTH_FAILED"
-	ErrorCodeVersionConflict   = "VERSION_CONFLICT"
-	ErrorCodeStateNotFound     = "STATE_NOT_FOUND"
-	ErrorCodeInternalError     = "INTERNAL_ERROR"
-	ErrorCodeConnectionClosed  = "CONNECTION_CLOSED"
-	ErrorCodeTimeout           = "TIMEOUT"
-	ErrorCodeTooManyRetries    = "TOO_MANY_RETRIES"
+	ErrorCodeInvalidMessage   = "INVALID_MESSAGE"
+	ErrorCodeAuthFailed       = "AUTH_FAILED"
+	ErrorCodeVersionConflict  = "VERSION_CONFLICT"
+	ErrorCodeStateNotFound    = "STATE_NOT_FOUND"
+	ErrorCodeInternalError    = "INTERNAL_ERROR"
+	ErrorCodeConnectionClosed = "CONNECTION_CLOSED"
+	ErrorCodeTimeout          = "TIMEOUT"
+	ErrorCodeTooManyRetries   = "TOO_MANY_RETRIES"
 )
 
 // MessageValidator provides validation for IPC messages
@@ -120,15 +120,16 @@ func (v *MessageValidator) ValidateHandshake(msg HandshakeMessage) error {
 
 	// Validate panel type is one of the expected values
 	validPanelTypes := map[string]bool{
-		"sessions": true,
-		"messages": true,
-		"input":    true,
+		"sessions":   true,
+		"messages":   true,
+		"input":      true,
+		"controller": true,
 	}
 
 	if !validPanelTypes[msg.PanelType] {
 		return &ValidationError{
 			Field:   "panel_type",
-			Message: "must be one of: sessions, messages, input",
+			Message: "must be one of: sessions, messages, input, controller",
 		}
 	}
 
@@ -305,7 +306,7 @@ func structToMap(data interface{}) (map[string]interface{}, error) {
 
 // isValidPanelType checks if a panel type is valid
 func isValidPanelType(panelType string) bool {
-	validTypes := []string{"sessions", "messages", "input"}
+	validTypes := []string{"sessions", "messages", "input", "controller"}
 	for _, valid := range validTypes {
 		if panelType == valid {
 			return true

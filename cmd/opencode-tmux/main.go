@@ -15,6 +15,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -31,41 +32,49 @@ import (
 
 // TmuxOrchestrator manages the tmux session and panels
 type TmuxOrchestrator struct {
-	sessionName   string
-	socketPath    string
-	statePath     string
-	httpClient    *opencode.Client
-	ipcServer     *ipc.SocketServer
-	syncManager   *state.PanelSyncManager
-	ctx           context.Context
-	cancel        context.CancelFunc
-	tmuxCommand   string
-	isRunning     bool
-	serverOnly    bool
-	sseClient     *http.Client
-	serverURL     string
-	config        *tmuxconfig.File
-	panes         map[string]string
-	reuseExisting bool
+	sessionName     string
+	socketPath      string
+	statePath       string
+	httpClient      *opencode.Client
+	ipcServer       *ipc.SocketServer
+	syncManager     *state.PanelSyncManager
+	ctx             context.Context
+	cancel          context.CancelFunc
+	tmuxCommand     string
+	isRunning       bool
+	serverOnly      bool
+	sseClient       *http.Client
+	serverURL       string
+	layout          *tmuxconfig.Layout
+	panes           map[string]string
+	reuseExisting   bool
+	forceNewSession bool
+	attachOnly      bool
+	configPath      string
+	layoutMutex     sync.Mutex
 }
 
 // NewTmuxOrchestrator creates a new tmux orchestrator
-func NewTmuxOrchestrator(sessionName, socketPath, statePath, serverURL string, httpClient *opencode.Client, serverOnly bool, cfg *tmuxconfig.File) *TmuxOrchestrator {
+func NewTmuxOrchestrator(sessionName, socketPath, statePath, serverURL string, httpClient *opencode.Client, serverOnly bool, layout *tmuxconfig.Layout, reuseExisting bool, forceNew bool, attachOnly bool, configPath string) *TmuxOrchestrator {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	return &TmuxOrchestrator{
-		sessionName: sessionName,
-		socketPath:  socketPath,
-		statePath:   statePath,
-		httpClient:  httpClient,
-		ctx:         ctx,
-		cancel:      cancel,
-		tmuxCommand: "tmux",
-		serverOnly:  serverOnly,
-		sseClient:   &http.Client{Timeout: 0}, // No timeout for SSE connections
-		serverURL:   serverURL,
-		config:      cfg,
-		panes:       map[string]string{},
+		sessionName:     sessionName,
+		socketPath:      socketPath,
+		statePath:       statePath,
+		httpClient:      httpClient,
+		ctx:             ctx,
+		cancel:          cancel,
+		tmuxCommand:     "tmux",
+		serverOnly:      serverOnly,
+		sseClient:       &http.Client{Timeout: 0}, // No timeout for SSE connections
+		serverURL:       serverURL,
+		layout:          layout,
+		panes:           map[string]string{},
+		reuseExisting:   reuseExisting,
+		forceNewSession: forceNew,
+		attachOnly:      attachOnly,
+		configPath:      configPath,
 	}
 }
 
@@ -107,30 +116,39 @@ func (orch *TmuxOrchestrator) Initialize() error {
 // Start creates and configures the tmux session with panels
 func (orch *TmuxOrchestrator) Start() error {
 	log.Printf("Starting tmux session: %s", orch.sessionName)
-	if orch.config != nil {
-		name := strings.TrimSpace(orch.config.Session.Name)
-		if name != "" {
-			orch.sessionName = name
-			log.Printf("Session name overridden by config: %s", orch.sessionName)
-		}
-	}
 
 	orch.panes = map[string]string{}
-
-	if orch.reuseExisting {
-		orch.isRunning = true
-		log.Printf("Reusing existing tmux session without reconfiguration")
-		return nil
-	}
 
 	// Check if tmux is available
 	if !orch.isTmuxAvailable() {
 		return fmt.Errorf("tmux is not available")
 	}
 
-	// Create tmux session
-	if err := orch.createTmuxSession(); err != nil {
-		return fmt.Errorf("failed to create tmux session: %w", err)
+	sessionExists := orch.sessionExists()
+
+	if sessionExists {
+		if orch.forceNewSession {
+			if err := orch.killTmuxSession(); err != nil {
+				return fmt.Errorf("failed to stop existing session: %w", err)
+			}
+			sessionExists = false
+		} else if orch.reuseExisting {
+			if err := orch.resetTmuxWindow(); err != nil {
+				return fmt.Errorf("failed to prepare existing session: %w", err)
+			}
+		} else {
+			if err := orch.killTmuxSession(); err != nil {
+				return fmt.Errorf("failed to stop existing session: %w", err)
+			}
+			sessionExists = false
+		}
+	}
+
+	if !sessionExists {
+		// Create tmux session
+		if err := orch.createTmuxSession(); err != nil {
+			return fmt.Errorf("failed to create tmux session: %w", err)
+		}
 	}
 
 	if orch.serverOnly {
@@ -342,6 +360,7 @@ func (orch *TmuxOrchestrator) startIPCServer() error {
 		orch.socketPath,
 		orch.syncManager.GetEventBus(),
 		orch.syncManager,
+		orch,
 	)
 
 	// Start server
@@ -360,9 +379,6 @@ func (orch *TmuxOrchestrator) isTmuxAvailable() bool {
 
 // createTmuxSession creates a new tmux session
 func (orch *TmuxOrchestrator) createTmuxSession() error {
-	// Kill existing session if it exists
-	orch.killTmuxSession()
-
 	// Create new session
 	cmd := exec.CommandContext(orch.ctx, orch.tmuxCommand, "new-session", "-d", "-s", orch.sessionName)
 	if err := cmd.Run(); err != nil {
@@ -372,9 +388,86 @@ func (orch *TmuxOrchestrator) createTmuxSession() error {
 	return nil
 }
 
+// sessionExists checks if the tmux session already exists.
+func (orch *TmuxOrchestrator) sessionExists() bool {
+	cmd := exec.CommandContext(orch.ctx, orch.tmuxCommand, "has-session", "-t", orch.sessionName)
+	if err := cmd.Run(); err != nil {
+		return false
+	}
+	return true
+}
+
+// resetTmuxWindow replaces the primary window with a fresh one for reconfiguration.
+func (orch *TmuxOrchestrator) resetTmuxWindow() error {
+	target := fmt.Sprintf("%s:0", orch.sessionName)
+
+	// Capture the current window id so we can remove it after creating a replacement.
+	currentWindowID, err := orch.getWindowID(target)
+	if err != nil {
+		log.Printf("Warning: failed to resolve current window id for %s: %v", target, err)
+		currentWindowID = ""
+	}
+
+	// Create a replacement window and capture its id.
+	cmd := exec.CommandContext(orch.ctx, orch.tmuxCommand, "new-window", "-d", "-t", orch.sessionName, "-P", "-F", "#{window_id}")
+	output, err := cmd.Output()
+	if err != nil {
+		return fmt.Errorf("failed to create replacement window: %w", err)
+	}
+	newWindowID := strings.TrimSpace(string(output))
+	if newWindowID == "" {
+		return fmt.Errorf("tmux did not return a window id for the replacement window")
+	}
+
+	// Move the replacement to index 0 so the rest of the code can target session:0 as usual.
+	moveCmd := exec.CommandContext(orch.ctx, orch.tmuxCommand, "move-window", "-s", newWindowID, "-t", target)
+	if err := moveCmd.Run(); err != nil {
+		return fmt.Errorf("failed to move replacement window to %s: %w", target, err)
+	}
+
+	// Remove the previous window if we captured it successfully.
+	if currentWindowID != "" {
+		killCmd := exec.CommandContext(orch.ctx, orch.tmuxCommand, "kill-window", "-t", currentWindowID)
+		if err := killCmd.Run(); err != nil {
+			log.Printf("Warning: failed to remove previous window %s: %v", currentWindowID, err)
+		}
+	}
+
+	// Ensure attached clients land on the refreshed window.
+	selectCmd := exec.CommandContext(orch.ctx, orch.tmuxCommand, "select-window", "-t", target)
+	if err := selectCmd.Run(); err != nil {
+		log.Printf("Warning: failed to select refreshed window %s: %v", target, err)
+	}
+
+	return nil
+}
+
+func (orch *TmuxOrchestrator) resetExistingSession() error {
+	log.Printf("Resetting tmux session for fresh start: %s", orch.sessionName)
+
+	if err := orch.killTmuxSession(); err != nil {
+		return err
+	}
+
+	if err := os.Remove(orch.statePath); err != nil && !os.IsNotExist(err) {
+		log.Printf("Warning: failed to remove state file %s: %v", orch.statePath, err)
+	} else if err == nil {
+		log.Printf("State file cleared for fresh start: %s", orch.statePath)
+	}
+
+	if err := os.Remove(orch.socketPath); err != nil && !os.IsNotExist(err) {
+		log.Printf("Warning: failed to remove socket file %s: %v", orch.socketPath, err)
+	} else if err == nil {
+		log.Printf("Socket file cleared: %s", orch.socketPath)
+	}
+
+	orch.reuseExisting = false
+	return nil
+}
+
 // configurePanels configures the tmux panel layout
 func (orch *TmuxOrchestrator) configurePanels() error {
-	if orch.config != nil {
+	if orch.layout != nil {
 		return orch.configurePanelsFromConfig()
 	}
 	return orch.configureDefaultPanels()
@@ -420,20 +513,36 @@ func (orch *TmuxOrchestrator) prepareExistingSession() error {
 		return nil
 	}
 
-	cmd := exec.Command(orch.tmuxCommand, "has-session", "-t", orch.sessionName)
-	if err := cmd.Run(); err != nil {
+	sessionExists := orch.sessionExists()
+
+	if orch.attachOnly {
+		if !sessionExists {
+			return fmt.Errorf("cannot attach: tmux session %s does not exist", orch.sessionName)
+		}
+		return nil
+	}
+
+	if !sessionExists {
+		return nil
+	}
+
+	if orch.forceNewSession {
+		return orch.resetExistingSession()
+	}
+
+	if orch.reuseExisting {
+		log.Printf("Existing tmux session detected; reusing without prompt")
 		return nil
 	}
 
 	if !isTerminal() {
-		log.Printf("Existing tmux session detected but stdin is not a terminal, creating new session")
-		if err := orch.killTmuxSession(); err != nil {
-			return err
-		}
+		log.Printf("Existing tmux session detected but stdin is not a terminal; defaulting to reuse")
+		orch.reuseExisting = true
+		return nil
 	}
 
 	fmt.Printf("An existing tmux session has been detected: %s\n", orch.sessionName)
-	fmt.Printf("Choose an action: [r] Reuse an existing session (default) / [n] Create new session/ [q] Exit: ")
+	fmt.Printf("Choose an action: [r] Reuse (default) / [n] Create new / [a] Attach only / [q] Exit: ")
 
 	reader := bufio.NewReader(os.Stdin)
 
@@ -452,30 +561,17 @@ func (orch *TmuxOrchestrator) prepareExistingSession() error {
 			orch.reuseExisting = true
 			return nil
 		case "n", "new":
-			log.Printf("User requested new tmux session, killing existing session: %s", orch.sessionName)
-			if err := orch.killTmuxSession(); err != nil {
+			if err := orch.resetExistingSession(); err != nil {
 				return err
 			}
-
-			// Clean state file to ensure fresh start with proper session selection
-			if err := os.Remove(orch.statePath); err != nil && !os.IsNotExist(err) {
-				log.Printf("Warning: failed to remove state file %s: %v", orch.statePath, err)
-			} else if err == nil {
-				log.Printf("State file cleared for fresh start: %s", orch.statePath)
-			}
-
-			// Clean socket file to prevent connection issues
-			if err := os.Remove(orch.socketPath); err != nil && !os.IsNotExist(err) {
-				log.Printf("Warning: failed to remove socket file %s: %v", orch.socketPath, err)
-			} else if err == nil {
-				log.Printf("Socket file cleared: %s", orch.socketPath)
-			}
-
+			return nil
+		case "a", "attach":
+			orch.attachOnly = true
 			return nil
 		case "q", "quit":
 			return fmt.Errorf("user cancels startup")
 		default:
-			fmt.Printf("Invalid input, please enter. r / n / q: ")
+			fmt.Printf("Invalid input, please enter r / n / a / q: ")
 		}
 	}
 }
@@ -486,9 +582,24 @@ func (orch *TmuxOrchestrator) configurePanelsFromConfig() error {
 	if err != nil {
 		return fmt.Errorf("failed to resolve root pane id: %w", err)
 	}
+	panes, err := orch.buildLayout(rootPane, orch.layout)
+	if err != nil {
+		return err
+	}
+	orch.panes = panes
+	return nil
+}
+
+// buildLayout applies the configured layout starting from the provided root pane.
+func (orch *TmuxOrchestrator) buildLayout(rootPane string, layout *tmuxconfig.Layout) (map[string]string, error) {
+	if layout == nil {
+		return nil, fmt.Errorf("layout configuration is not available")
+	}
+
 	panes := map[string]string{
 		"root": rootPane,
 	}
+
 	type paneLock struct {
 		lockX bool
 		lockY bool
@@ -505,63 +616,64 @@ func (orch *TmuxOrchestrator) configurePanelsFromConfig() error {
 		return lock
 	}
 
-	for _, split := range orch.config.Splits {
-		target, ok := panes[split.Target]
+	for _, split := range layout.Splits {
+		targetPane, ok := panes[split.Target]
 		if !ok {
-			return fmt.Errorf("unknown split target: %s", split.Target)
+			return nil, fmt.Errorf("unknown split target: %s", split.Target)
 		}
 
 		if len(split.Panels) != 2 {
-			return fmt.Errorf("split %s must define exactly two panels", split.Target)
+			return nil, fmt.Errorf("split %s must define exactly two panels", split.Target)
 		}
 
 		args := []string{"split-window", "-P", "-F", "#{pane_id}"}
 		typ := strings.ToLower(strings.TrimSpace(split.Type))
 		if typ == "horizontal" {
 			args = append(args, "-h")
-		}
-		if typ != "horizontal" {
+		} else {
 			args = append(args, "-v")
 		}
 
-		first := split.Panels[0]
-		second := split.Panels[1]
-
 		if split.Ratio != "" {
-			_, secondPct, ok := orch.config.RatioPercents(split.Ratio)
+			_, secondPct, ok := layout.RatioPercents(split.Ratio)
 			if ok {
 				args = append(args, "-p", fmt.Sprintf("%d", secondPct))
-				lock := getLock(first)
-				lockSecond := getLock(second)
+				lockA := getLock(split.Panels[0])
+				lockB := getLock(split.Panels[1])
 				if typ == "horizontal" {
-					lock.lockX = true
-					lockSecond.lockX = true
+					lockA.lockX = true
+					lockB.lockX = true
 				} else {
-					lock.lockY = true
-					lockSecond.lockY = true
+					lockA.lockY = true
+					lockB.lockY = true
 				}
 			} else {
 				log.Printf("Invalid ratio %q for split %s, falling back to tmux defaults", split.Ratio, split.Target)
 			}
 		}
 
-		args = append(args, "-t", target)
+		args = append(args, "-t", targetPane)
 
 		cmd := exec.CommandContext(orch.ctx, orch.tmuxCommand, args...)
 		out, err := cmd.Output()
 		if err != nil {
-			return fmt.Errorf("failed to split pane %s (%s): %w", split.Target, split.Type, err)
+			return nil, fmt.Errorf("failed to split pane %s (%s): %w", split.Target, split.Type, err)
+		}
+		newPane := strings.TrimSpace(string(out))
+		if newPane == "" {
+			return nil, fmt.Errorf("tmux did not return a pane id for split target %s", split.Target)
 		}
 
-		newPane := strings.TrimSpace(string(out))
+		first := split.Panels[0]
+		second := split.Panels[1]
 
-		panes[first] = target
+		// The original pane becomes the first panel; the new pane is the second.
+		panes[first] = targetPane
 		panes[second] = newPane
-
 	}
 
-	for _, panel := range orch.config.Panels {
-		target, ok := panes[panel.ID]
+	for _, panel := range layout.Panels {
+		targetPane, ok := panes[panel.ID]
 		if !ok {
 			continue
 		}
@@ -569,25 +681,33 @@ func (orch *TmuxOrchestrator) configurePanelsFromConfig() error {
 
 		width := strings.TrimSpace(panel.Width)
 		if width != "" && (lock == nil || !lock.lockX) {
-			if err := orch.resizePane(target, "x", width); err != nil {
+			if err := orch.resizePane(targetPane, "x", width); err != nil {
 				log.Printf("Failed to apply width for %s: %v", panel.ID, err)
 			}
 		}
 
 		height := strings.TrimSpace(panel.Height)
 		if height != "" && (lock == nil || !lock.lockY) {
-			if err := orch.resizePane(target, "y", height); err != nil {
+			if err := orch.resizePane(targetPane, "y", height); err != nil {
 				log.Printf("Failed to apply height for %s: %v", panel.ID, err)
 			}
 		}
 	}
 
-	orch.panes = panes
-	return nil
+	return panes, nil
 }
 
 func (orch *TmuxOrchestrator) resolvePaneID(target string) (string, error) {
 	cmd := exec.CommandContext(orch.ctx, orch.tmuxCommand, "display-message", "-p", "-t", target, "#{pane_id}")
+	out, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
+func (orch *TmuxOrchestrator) getWindowID(target string) (string, error) {
+	cmd := exec.CommandContext(orch.ctx, orch.tmuxCommand, "display-message", "-p", "-t", target, "#{window_id}")
 	out, err := cmd.Output()
 	if err != nil {
 		return "", err
@@ -628,7 +748,7 @@ func (orch *TmuxOrchestrator) triggerUIAction(action string, data map[string]int
 
 // startPanelApplications starts the applications in each panel
 func (orch *TmuxOrchestrator) startPanelApplications() error {
-	if orch.config != nil {
+	if orch.layout != nil {
 		return orch.startConfigPanelApplications()
 	}
 	return orch.startDefaultPanelApplications()
@@ -693,7 +813,7 @@ func (orch *TmuxOrchestrator) startConfigPanelApplications() error {
 	time.Sleep(1 * time.Second)
 
 	success := 0
-	for idx, panel := range orch.config.Panels {
+	for idx, panel := range orch.layout.Panels {
 		target, ok := orch.panes[panel.ID]
 		if !ok {
 			log.Printf("Pane target for %s not found; skipping", panel.ID)
@@ -706,7 +826,7 @@ func (orch *TmuxOrchestrator) startConfigPanelApplications() error {
 			continue
 		}
 
-		log.Printf("Starting %s panel (%d/%d)...", panel.ID, idx+1, len(orch.config.Panels))
+		log.Printf("Starting %s panel (%d/%d)...", panel.ID, idx+1, len(orch.layout.Panels))
 		if err := orch.startPanelApp(target, appName, envVars); err != nil {
 			log.Printf("Failed to start %s panel: %v", panel.ID, err)
 			continue
@@ -857,9 +977,9 @@ func (orch *TmuxOrchestrator) getBinaryPath(appName string) (string, error) {
 func (orch *TmuxOrchestrator) verifyPanelsRunning() bool {
 	targets := []string{}
 
-	if orch.config != nil {
+	if orch.layout != nil {
 		seen := map[string]struct{}{}
-		for _, panel := range orch.config.Panels {
+		for _, panel := range orch.layout.Panels {
 			paneTarget, ok := orch.panes[panel.ID]
 			if !ok {
 				continue
@@ -897,11 +1017,217 @@ func (orch *TmuxOrchestrator) verifyPanelsRunning() bool {
 	return panelsRunning > 0
 }
 
+// ReloadLayout reapplies the tmux layout from configuration without restarting running panels.
+func (orch *TmuxOrchestrator) ReloadLayout() error {
+	if orch.serverOnly {
+		return fmt.Errorf("cannot reload layout in server-only mode")
+	}
+	if orch.configPath == "" {
+		return fmt.Errorf("layout config path is not configured")
+	}
+	if !orch.sessionExists() {
+		return fmt.Errorf("tmux session %s is not running", orch.sessionName)
+	}
+
+	orch.layoutMutex.Lock()
+	defer orch.layoutMutex.Unlock()
+
+	layoutCfg, err := tmuxconfig.LoadLayout(orch.configPath)
+	if err != nil {
+		return fmt.Errorf("failed to load layout config: %w", err)
+	}
+
+	oldWindowTarget := fmt.Sprintf("%s:0", orch.sessionName)
+	oldWindowID, err := orch.getWindowID(oldWindowTarget)
+	if err != nil {
+		log.Printf("Warning: unable to determine current window id: %v", err)
+		oldWindowID = ""
+	}
+
+	oldPaneMap := make(map[string]string, len(orch.panes))
+	for id, pane := range orch.panes {
+		oldPaneMap[id] = pane
+	}
+
+	// Create staging window that will host the new layout.
+	cmd := exec.CommandContext(orch.ctx, orch.tmuxCommand, "new-window", "-d", "-t", orch.sessionName, "-P", "-F", "#{window_id}")
+	output, err := cmd.Output()
+	if err != nil {
+		return fmt.Errorf("failed to create staging window: %w", err)
+	}
+	newWindowID := strings.TrimSpace(string(output))
+	if newWindowID == "" {
+		return fmt.Errorf("tmux did not return a window id for the staging window")
+	}
+
+	success := false
+	defer func() {
+		if !success {
+			_ = exec.CommandContext(orch.ctx, orch.tmuxCommand, "kill-window", "-t", newWindowID).Run()
+		}
+	}()
+
+	newRootPane, err := orch.resolvePaneID(newWindowID)
+	if err != nil {
+		return fmt.Errorf("failed to resolve staging window root pane: %w", err)
+	}
+
+	newPaneMap, err := orch.buildLayout(newRootPane, layoutCfg)
+	if err != nil {
+		return fmt.Errorf("failed to build layout in staging window: %w", err)
+	}
+
+	movedPanels := make(map[string]bool)
+	for _, panel := range layoutCfg.Panels {
+		newPaneID, ok := newPaneMap[panel.ID]
+		if !ok || newPaneID == "" {
+			continue
+		}
+		oldPaneID := oldPaneMap[panel.ID]
+		if oldPaneID == "" || oldPaneID == newPaneID {
+			continue
+		}
+		if err := orch.swapPaneContents(oldPaneID, newPaneID); err != nil {
+			log.Printf("Warning: failed to move panel %s (%s -> %s): %v", panel.ID, oldPaneID, newPaneID, err)
+			continue
+		}
+		movedPanels[panel.ID] = true
+	}
+
+	// Position the staging window as the primary window.
+	target := fmt.Sprintf("%s:0", orch.sessionName)
+	if err := exec.CommandContext(orch.ctx, orch.tmuxCommand, "move-window", "-s", newWindowID, "-t", target).Run(); err != nil {
+		log.Printf("Warning: failed to move staging window to %s: %v", target, err)
+	}
+
+	// Remove the previous window to avoid leaving shells behind.
+	if oldWindowID != "" && oldWindowID != newWindowID {
+		if err := exec.CommandContext(orch.ctx, orch.tmuxCommand, "kill-window", "-t", oldWindowID).Run(); err != nil {
+			log.Printf("Warning: failed to kill previous window %s: %v", oldWindowID, err)
+		}
+	}
+
+	// Update orchestrator state.
+	orch.layout = layoutCfg
+	orch.panes = newPaneMap
+
+	if err := orch.startMissingPanels(layoutCfg, newPaneMap, movedPanels); err != nil {
+		log.Printf("Warning: failed to start all new panels after layout reload: %v", err)
+	}
+
+	// Ensure clients focus the refreshed window.
+	if err := exec.CommandContext(orch.ctx, orch.tmuxCommand, "select-window", "-t", target).Run(); err != nil {
+		log.Printf("Warning: failed to select refreshed window: %v", err)
+	}
+
+	success = true
+	log.Printf("Layout reloaded successfully")
+	return nil
+}
+
 // killTmuxSession kills the tmux session if it exists
 func (orch *TmuxOrchestrator) killTmuxSession() error {
 	cmd := exec.Command(orch.tmuxCommand, "kill-session", "-t", orch.sessionName)
-	cmd.Run() // Ignore errors as session might not exist
+	if err := cmd.Run(); err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			// tmux returns exit status 1 when the session does not exist; treat as success.
+			if exitErr.ExitCode() == 1 {
+				return nil
+			}
+		}
+		return err
+	}
 	return nil
+}
+
+// swapPaneContents swaps the processes between two tmux panes.
+func (orch *TmuxOrchestrator) swapPaneContents(sourcePane, targetPane string) error {
+	if strings.TrimSpace(sourcePane) == "" || strings.TrimSpace(targetPane) == "" {
+		return fmt.Errorf("invalid pane ids for swap")
+	}
+	if sourcePane == targetPane {
+		return nil
+	}
+	cmd := exec.CommandContext(orch.ctx, orch.tmuxCommand, "swap-pane", "-s", sourcePane, "-t", targetPane)
+	return cmd.Run()
+}
+
+// startMissingPanels launches applications for panels that did not inherit an existing process.
+func (orch *TmuxOrchestrator) startMissingPanels(layoutCfg *tmuxconfig.Layout, panes map[string]string, moved map[string]bool) error {
+	if layoutCfg == nil {
+		return nil
+	}
+
+	envVars := map[string]string{
+		"OPENCODE_SERVER": os.Getenv("OPENCODE_SERVER"),
+		"OPENCODE_SOCKET": orch.socketPath,
+	}
+
+	var errs []string
+	for _, panel := range layoutCfg.Panels {
+		if moved[panel.ID] {
+			continue
+		}
+		targetPane, ok := panes[panel.ID]
+		if !ok || strings.TrimSpace(targetPane) == "" {
+			continue
+		}
+
+		appName, err := resolvePanelAppName(panel)
+		if err != nil {
+			errs = append(errs, fmt.Sprintf("%s: %v", panel.ID, err))
+			continue
+		}
+
+		if err := orch.startPanelApp(targetPane, appName, envVars); err != nil {
+			errs = append(errs, fmt.Sprintf("%s: %v", panel.ID, err))
+			continue
+		}
+		log.Printf("Started panel %s after layout reload", panel.ID)
+	}
+
+	if len(errs) > 0 {
+		return fmt.Errorf(strings.Join(errs, "; "))
+	}
+	return nil
+}
+
+// sendReloadLayoutCommand connects to the running orchestrator and requests a layout reload.
+func sendReloadLayoutCommand(socketPath, sessionName string) error {
+	socketPath = strings.TrimSpace(socketPath)
+	if socketPath == "" {
+		return fmt.Errorf("socket path is empty")
+	}
+
+	if _, err := os.Stat(socketPath); err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("orchestrator is not running (socket %s not found)", socketPath)
+		}
+		return fmt.Errorf("failed to access socket %s: %w", socketPath, err)
+	}
+
+	panelID := fmt.Sprintf("controller-%s-%d", sessionName, time.Now().UnixNano())
+	client := ipc.NewSocketClient(socketPath, panelID, "controller")
+	if err := client.Connect(); err != nil {
+		return fmt.Errorf("failed to connect to orchestrator socket: %w", err)
+	}
+	defer func() {
+		_ = client.Disconnect()
+	}()
+
+	if err := client.SendOrchestratorCommand("reload_layout"); err != nil {
+		return err
+	}
+	return nil
+}
+
+// attachExistingSession attaches to an already-running tmux session without modifying orchestrator state.
+func (orch *TmuxOrchestrator) attachExistingSession() error {
+	cmd := exec.Command(orch.tmuxCommand, "attach-session", "-t", orch.sessionName)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
 }
 
 // attachToSession attaches to the tmux session
@@ -1058,8 +1384,35 @@ func main() {
 
 	// Parse command line arguments
 	var serverOnly bool
+	var reuseSessionFlag bool
+	var forceNewSessionFlag bool
+	var attachOnlyFlag bool
+	var reloadLayoutFlag bool
 	flag.BoolVar(&serverOnly, "server-only", false, "Only start IPC server without panels")
+	flag.BoolVar(&reuseSessionFlag, "reuse-session", false, "Reuse an existing tmux session without prompting")
+	flag.BoolVar(&forceNewSessionFlag, "force-new-session", false, "Force creation of a new tmux session, replacing any existing session")
+	flag.BoolVar(&attachOnlyFlag, "attach-only", false, "Attach to an existing tmux session and exit without reconfiguring panels")
+	flag.BoolVar(&reloadLayoutFlag, "reload-layout", false, "Reload the tmux layout without restarting panel processes")
 	flag.Parse()
+
+	if reuseSessionFlag && forceNewSessionFlag {
+		log.Fatal("cannot specify both --reuse-session and --force-new-session")
+	}
+	if attachOnlyFlag && forceNewSessionFlag {
+		log.Fatal("cannot combine --attach-only with --force-new-session")
+	}
+	if attachOnlyFlag && serverOnly {
+		log.Fatal("cannot combine --attach-only with --server-only")
+	}
+	if reloadLayoutFlag && serverOnly {
+		log.Fatal("cannot combine --reload-layout with --server-only")
+	}
+	if reloadLayoutFlag && forceNewSessionFlag {
+		log.Fatal("cannot combine --reload-layout with --force-new-session")
+	}
+	if reloadLayoutFlag && attachOnlyFlag {
+		log.Fatal("cannot combine --reload-layout with --attach-only")
+	}
 
 	sessionName := "opencode"
 	sessionOverride := false
@@ -1084,15 +1437,9 @@ func main() {
 		configPath = filepath.Join(homeDir, ".opencode", "tmux.yaml")
 	}
 
-	cfg, err := tmuxconfig.Load(configPath)
+	sessionCfg, err := tmuxconfig.LoadSession(configPath)
 	if err != nil {
-		log.Fatalf("Failed to load tmux config: %v", err)
-	}
-	if !sessionOverride {
-		name := strings.TrimSpace(cfg.Session.Name)
-		if name != "" {
-			sessionName = name
-		}
+		log.Fatalf("Failed to load tmux session config: %v", err)
 	}
 
 	socketPath := os.Getenv("OPENCODE_SOCKET")
@@ -1103,6 +1450,33 @@ func main() {
 	statePath := os.Getenv("OPENCODE_STATE")
 	if statePath == "" {
 		statePath = filepath.Join(homeDir, ".opencode", "state.json")
+	}
+
+	if reloadLayoutFlag {
+		if !sessionOverride {
+			name := strings.TrimSpace(sessionCfg.Session.Name)
+			if name != "" {
+				sessionName = name
+			}
+		}
+		if err := sendReloadLayoutCommand(socketPath, sessionName); err != nil {
+			fmt.Fprintf(os.Stderr, "Reload layout failed: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println("Reload layout command sent successfully.")
+		return
+	}
+
+	layoutCfg, err := tmuxconfig.LoadLayout(configPath)
+	if err != nil {
+		log.Fatalf("Failed to load tmux layout config: %v", err)
+	}
+
+	if !sessionOverride {
+		name := strings.TrimSpace(sessionCfg.Session.Name)
+		if name != "" {
+			sessionName = name
+		}
 	}
 
 	// Create HTTP client
@@ -1117,10 +1491,17 @@ func main() {
 	}
 
 	// Create orchestrator
-	orchestrator := NewTmuxOrchestrator(sessionName, socketPath, statePath, serverURL, httpClient, serverOnly, cfg)
+	orchestrator := NewTmuxOrchestrator(sessionName, socketPath, statePath, serverURL, httpClient, serverOnly, layoutCfg, reuseSessionFlag, forceNewSessionFlag, attachOnlyFlag, configPath)
 
 	if err := orchestrator.prepareExistingSession(); err != nil {
 		log.Fatal(err)
+	}
+
+	if orchestrator.attachOnly {
+		if err := orchestrator.attachExistingSession(); err != nil {
+			log.Fatalf("Failed to attach to tmux session: %v", err)
+		}
+		return
 	}
 
 	if serverOnly {

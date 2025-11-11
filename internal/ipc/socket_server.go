@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -23,6 +24,7 @@ type SocketServer struct {
 	connectionsMux sync.RWMutex
 	eventBus       interfaces.EventBus
 	stateManager   interfaces.StateManager
+	control        interfaces.OrchestratorControl
 	ctx            context.Context
 	cancel         context.CancelFunc
 	isRunning      bool
@@ -60,7 +62,7 @@ func (cc *ClientConnection) send(message IPCMessage) error {
 }
 
 // NewSocketServer creates a new Unix Domain Socket server
-func NewSocketServer(socketPath string, eventBus interfaces.EventBus, stateManager interfaces.StateManager) *SocketServer {
+func NewSocketServer(socketPath string, eventBus interfaces.EventBus, stateManager interfaces.StateManager, control interfaces.OrchestratorControl) *SocketServer {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	return &SocketServer{
@@ -68,6 +70,7 @@ func NewSocketServer(socketPath string, eventBus interfaces.EventBus, stateManag
 		connections:  make(map[string]*ClientConnection),
 		eventBus:     eventBus,
 		stateManager: stateManager,
+		control:      control,
 		ctx:          ctx,
 		cancel:       cancel,
 	}
@@ -298,6 +301,8 @@ func (server *SocketServer) processClientMessage(clientConn *ClientConnection, m
 		server.handleClearSessionMessages(clientConn, message)
 	case "ping":
 		server.handlePing(clientConn, message)
+	case "orchestrator_command":
+		server.handleOrchestratorCommand(clientConn, message)
 	default:
 		log.Printf("Unknown message type from client %s: %s", clientConn.ID, message.Type)
 		server.sendError(clientConn, "unknown message type")
@@ -456,6 +461,47 @@ func (server *SocketServer) sendErrorMessage(clientConn *ClientConnection, messa
 	}
 	if err := clientConn.send(response); err != nil {
 		log.Printf("Failed to send structured error message: %v", err)
+	}
+}
+
+// handleOrchestratorCommand processes control commands sent to the orchestrator via IPC.
+func (server *SocketServer) handleOrchestratorCommand(clientConn *ClientConnection, message IPCMessage) {
+	if server.control == nil {
+		server.sendErrorMessage(clientConn, "orchestrator_command_response", "control handler not configured", message.RequestID)
+		return
+	}
+
+	var payload struct {
+		Command string `json:"command"`
+	}
+	if err := mapToStruct(message.Data, &payload); err != nil || strings.TrimSpace(payload.Command) == "" {
+		server.sendErrorMessage(clientConn, "orchestrator_command_response", "invalid command payload", message.RequestID)
+		return
+	}
+
+	switch strings.ToLower(payload.Command) {
+	case "reload_layout":
+		if err := server.control.ReloadLayout(); err != nil {
+			log.Printf("Reload layout command failed: %v", err)
+			server.sendErrorMessage(clientConn, "orchestrator_command_response", err.Error(), message.RequestID)
+			return
+		}
+	default:
+		server.sendErrorMessage(clientConn, "orchestrator_command_response", "unsupported command", message.RequestID)
+		return
+	}
+
+	response := IPCMessage{
+		Type:      "orchestrator_command_response",
+		RequestID: message.RequestID,
+		Data: map[string]interface{}{
+			"success": true,
+			"command": strings.ToLower(payload.Command),
+		},
+		Timestamp: time.Now(),
+	}
+	if err := clientConn.send(response); err != nil {
+		log.Printf("Failed to send orchestrator command response: %v", err)
 	}
 }
 
