@@ -14,6 +14,8 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -32,26 +34,28 @@ import (
 
 // TmuxOrchestrator manages the tmux session and panels
 type TmuxOrchestrator struct {
-	sessionName     string
-	socketPath      string
-	statePath       string
-	httpClient      *opencode.Client
-	ipcServer       *ipc.SocketServer
-	syncManager     *state.PanelSyncManager
-	ctx             context.Context
-	cancel          context.CancelFunc
-	tmuxCommand     string
-	isRunning       bool
-	serverOnly      bool
-	sseClient       *http.Client
-	serverURL       string
-	layout          *tmuxconfig.Layout
-	panes           map[string]string
-	reuseExisting   bool
-	forceNewSession bool
-	attachOnly      bool
-	configPath      string
-	layoutMutex     sync.Mutex
+	sessionName      string
+	socketPath       string
+	statePath        string
+	httpClient       *opencode.Client
+	ipcServer        *ipc.SocketServer
+	syncManager      *state.PanelSyncManager
+	ctx              context.Context
+	cancel           context.CancelFunc
+	tmuxCommand      string
+	isRunning        bool
+	serverOnly       bool
+	sseClient        *http.Client
+	serverURL        string
+	layout           *tmuxconfig.Layout
+	panes            map[string]string
+	reuseExisting    bool
+	forceNewSession  bool
+	attachOnly       bool
+	configPath       string
+	layoutMutex      sync.Mutex
+	paneSupervisorMu sync.Mutex
+	paneSupervisors  map[string]context.CancelFunc
 }
 
 // NewTmuxOrchestrator creates a new tmux orchestrator
@@ -71,6 +75,7 @@ func NewTmuxOrchestrator(sessionName, socketPath, statePath, serverURL string, h
 		serverURL:       serverURL,
 		layout:          layout,
 		panes:           map[string]string{},
+		paneSupervisors: map[string]context.CancelFunc{},
 		reuseExisting:   reuseExisting,
 		forceNewSession: forceNew,
 		attachOnly:      attachOnly,
@@ -179,6 +184,13 @@ func (orch *TmuxOrchestrator) Stop() error {
 	// Cancel context to signal shutdown
 	orch.cancel()
 
+	orch.paneSupervisorMu.Lock()
+	for _, cancel := range orch.paneSupervisors {
+		cancel()
+	}
+	orch.paneSupervisors = map[string]context.CancelFunc{}
+	orch.paneSupervisorMu.Unlock()
+
 	// Stop sync manager
 	if orch.syncManager != nil {
 		orch.syncManager.Stop()
@@ -279,6 +291,8 @@ func (orch *TmuxOrchestrator) handleEvents(eventChan chan types.StateEvent) {
 			if err := orch.handleThemeChanged(event); err != nil {
 				log.Printf("Error handling theme change: %v", err)
 			}
+		case types.EventPanelDisconnected:
+			orch.handlePanelDisconnected(event)
 		default:
 			// Handle other event types if needed
 			log.Printf("Received event: %s from panel %s", event.Type, event.SourcePanel)
@@ -327,6 +341,79 @@ func (orch *TmuxOrchestrator) handleThemeChanged(event types.StateEvent) error {
 
 	log.Printf("[TMUX] Failed to extract theme from event payload")
 	return nil
+}
+
+func (orch *TmuxOrchestrator) handlePanelDisconnected(event types.StateEvent) {
+	panelID, panelType := extractPanelConnectionInfo(event.Data)
+	if panelID == "" && panelType == "" {
+		log.Printf("[TMUX] panel disconnect event missing identifiers: %+v", event.Data)
+		return
+	}
+
+	target := orch.getPaneTarget(panelID, panelType)
+	if strings.TrimSpace(target) == "" {
+		log.Printf("[TMUX] No pane target recorded for panel %s (%s)", panelID, panelType)
+		return
+	}
+
+	appName, err := orch.getPanelAppName(panelID, panelType)
+	if err != nil {
+		log.Printf("[TMUX] Unable to resolve app for panel %s (%s): %v", panelID, panelType, err)
+		return
+	}
+
+	for attempt := 0; attempt < 3; attempt++ {
+		if orch.paneExists(target) && orch.paneMatchesApp(target, appName) {
+			break
+		}
+		log.Printf("[TMUX] Pane %s for panel %s (%s) missing/stale (attempt %d); attempting recover", target, panelID, panelType, attempt+1)
+		recovered, err := orch.recoverMissingPane(panelID, panelType)
+		if err != nil {
+			log.Printf("[TMUX] Failed to recover pane for %s (%s): %v", panelID, panelType, err)
+			return
+		}
+		if strings.TrimSpace(recovered) == "" {
+			log.Printf("[TMUX] Pane recovery did not yield target for %s (%s)", panelID, panelType)
+			return
+		}
+		if !orch.paneExists(recovered) {
+			log.Printf("[TMUX] Pane %s still unavailable after recovery", recovered)
+			return
+		}
+		log.Printf("[TMUX] Pane %s recovered and ready", recovered)
+		target = recovered
+	}
+	orch.updatePaneTarget(panelID, panelType, target)
+	if !orch.paneExists(target) {
+		log.Printf("[TMUX] Pane %s for panel %s (%s) unavailable after recovery attempts; performing full window recovery", target, panelID, panelType)
+		if err := orch.fullWindowRecovery(); err != nil {
+			log.Printf("[TMUX] Full window recovery failed: %v", err)
+			return
+		}
+		target = orch.getPaneTarget(panelID, panelType)
+		orch.updatePaneTarget(panelID, panelType, target)
+		if !orch.paneExists(target) {
+			log.Printf("[TMUX] Pane %s for panel %s (%s) still unavailable after full recovery", target, panelID, panelType)
+			return
+		}
+	}
+
+	if orch.paneExists(target) && orch.paneMatchesApp(target, appName) {
+		log.Printf("[TMUX] Pane %s for panel %s (%s) already running %s; skipping restart", target, panelID, panelType, appName)
+		return
+	}
+
+	envVars := map[string]string{
+		"OPENCODE_SERVER": os.Getenv("OPENCODE_SERVER"),
+		"OPENCODE_SOCKET": orch.socketPath,
+	}
+
+	go func(panelID, panelType, paneTarget, app string) {
+		log.Printf("[TMUX] Restarting panel %s (%s) after disconnect", panelID, panelType)
+		if err := orch.startPanelApp(paneTarget, app, envVars); err != nil {
+			log.Printf("[TMUX] Failed to restart panel %s (%s): %v", panelID, panelType, err)
+		}
+	}(panelID, panelType, target, appName)
 }
 
 // applyGlobalTheme applies the theme to all connected panels
@@ -499,11 +586,14 @@ func (orch *TmuxOrchestrator) configureDefaultPanels() error {
 		log.Printf("Warning: failed to resize input pane: %v", err)
 	}
 
-	orch.panes = map[string]string{
+	panes := map[string]string{
 		"sessions": sessionTarget + ".0",
 		"messages": sessionTarget + ".1",
 		"input":    sessionTarget + ".2",
 	}
+	panes = orch.normalizePaneMap(panes)
+	orch.panes = panes
+	orch.logPaneAssignments("configure_default", orch.panes)
 
 	return nil
 }
@@ -587,6 +677,7 @@ func (orch *TmuxOrchestrator) configurePanelsFromConfig() error {
 		return err
 	}
 	orch.panes = panes
+	orch.logPaneAssignments("configure_panels", orch.panes)
 	return nil
 }
 
@@ -694,7 +785,7 @@ func (orch *TmuxOrchestrator) buildLayout(rootPane string, layout *tmuxconfig.La
 		}
 	}
 
-	return panes, nil
+	return orch.normalizePaneMap(panes), nil
 }
 
 func (orch *TmuxOrchestrator) resolvePaneID(target string) (string, error) {
@@ -896,44 +987,446 @@ func resolvePanelAppName(panelCfg tmuxconfig.Panel) (string, error) {
 
 // startPanelApp starts an application in a specific tmux pane
 func (orch *TmuxOrchestrator) startPanelApp(paneTarget, appName string, envVars map[string]string) error {
-	// Build command with environment variables
-	var envCmd string
-	for key, value := range envVars {
-		if value != "" {
-			envCmd += fmt.Sprintf("export %s='%s'; ", key, value)
-		}
+	normalizedTarget := orch.normalizePaneTarget(paneTarget)
+	if err := orch.launchPaneProcess(normalizedTarget, appName, envVars); err != nil {
+		return err
 	}
+
+	orch.startPaneSupervisor(normalizedTarget, appName, envVars)
+	return nil
+}
+
+func (orch *TmuxOrchestrator) launchPaneProcess(paneTarget, appName string, envVars map[string]string) error {
+	paneTarget = orch.normalizePaneTarget(paneTarget)
 
 	run := strings.TrimSpace(appName)
 	binaryPath, err := orch.getBinaryPath(appName)
 	if err == nil {
 		run = binaryPath
-	}
-	if err != nil {
+	} else {
 		log.Printf("[DEBUG] Using raw command for %s: %v", appName, err)
 	}
 	if run == "" {
 		return fmt.Errorf("no command for panel %s", appName)
 	}
 
-	command := fmt.Sprintf("%s%s; sleep 600", envCmd, run)
+	command := orch.buildPaneCommand(run, envVars)
+	log.Printf("[DEBUG] Respawning pane %s with command: %s", paneTarget, command)
 
-	log.Printf("[DEBUG] Sending command to pane %s: %s", paneTarget, command)
-
-	// Send command to pane
-	cmd := exec.CommandContext(orch.ctx, orch.tmuxCommand, "send-keys", "-t", paneTarget, command, "Enter")
-	if err := cmd.Run(); err != nil {
-		log.Printf("[DEBUG] Error sending command to pane %s: %v", paneTarget, err)
-		time.Sleep(500 * time.Millisecond)
-		return fmt.Errorf("failed to send command to pane %s: %w", paneTarget, err)
+	cmd := exec.CommandContext(orch.ctx, orch.tmuxCommand, "respawn-pane", "-k", "-t", paneTarget, command)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		trimmedOutput := strings.TrimSpace(string(output))
+		if trimmedOutput != "" {
+			log.Printf("[ERROR] tmux respawn-pane output for %s: %s", paneTarget, trimmedOutput)
+		}
+		return fmt.Errorf("failed to respawn pane %s: %w", paneTarget, err)
 	}
 
-	log.Printf("[DEBUG] Successfully sent command to pane %s", paneTarget)
-
-	// Give the application time to start
-	time.Sleep(500 * time.Millisecond)
+	if !orch.waitForPaneProcess(paneTarget, 3*time.Second) {
+		return fmt.Errorf("pane %s did not become active after launching %s", paneTarget, appName)
+	}
 
 	return nil
+}
+
+func (orch *TmuxOrchestrator) normalizePaneTarget(paneTarget string) string {
+	target := strings.TrimSpace(paneTarget)
+	if target == "" {
+		return target
+	}
+	// If the target is already in session:window.pane form, keep it.
+	if strings.Contains(target, ":") && strings.Contains(target, ".") && !strings.HasPrefix(target, "%") && isQualifiedPaneTarget(target) {
+		return target
+	}
+	if strings.HasPrefix(target, "%") {
+		cmd := exec.CommandContext(orch.ctx, orch.tmuxCommand, "display-message", "-p", "-t", target, "#{session_name}:#{window_index}.#{pane_index}")
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			log.Printf("[DEBUG] Failed to normalize pane target %s: %v", target, err)
+			return target
+		}
+		normalized := strings.TrimSpace(string(output))
+		if normalized != "" && isQualifiedPaneTarget(normalized) {
+			return normalized
+		}
+		log.Printf("[DEBUG] Normalized pane target %s produced ambiguous value %q; keeping original", target, normalized)
+	}
+	return target
+}
+
+func (orch *TmuxOrchestrator) normalizePaneMap(panes map[string]string) map[string]string {
+	normalized := make(map[string]string, len(panes))
+	for id, target := range panes {
+		normalized[id] = orch.normalizePaneTarget(target)
+	}
+	return normalized
+}
+
+func (orch *TmuxOrchestrator) logPaneAssignments(context string, panes map[string]string) {
+	if len(panes) == 0 {
+		log.Printf("[DEBUG] pane assignment (%s): <none>", context)
+		return
+	}
+	for id, target := range panes {
+		normalized := orch.normalizePaneTarget(target)
+		if normalized != target {
+			log.Printf("[DEBUG] pane assignment (%s): %s -> %s (%s)", context, id, target, normalized)
+		} else {
+			log.Printf("[DEBUG] pane assignment (%s): %s -> %s", context, id, target)
+		}
+	}
+}
+
+func isQualifiedPaneTarget(value string) bool {
+	parts := strings.Split(value, ":")
+	if len(parts) != 2 {
+		return false
+	}
+	if strings.TrimSpace(parts[0]) == "" {
+		return false
+	}
+	sub := strings.Split(parts[1], ".")
+	if len(sub) != 2 {
+		return false
+	}
+	if _, err := strconv.Atoi(sub[0]); err != nil {
+		return false
+	}
+	if _, err := strconv.Atoi(sub[1]); err != nil {
+		return false
+	}
+	return true
+}
+
+func (orch *TmuxOrchestrator) paneExists(target string) bool {
+	trimmed := strings.TrimSpace(target)
+	if trimmed == "" {
+		return false
+	}
+	checkTargets := []string{}
+	normalized := orch.normalizePaneTarget(trimmed)
+	if normalized != trimmed {
+		checkTargets = append(checkTargets, normalized)
+	}
+	checkTargets = append(checkTargets, trimmed)
+	for _, t := range checkTargets {
+		if strings.TrimSpace(t) == "" {
+			continue
+		}
+		cmd := exec.CommandContext(orch.ctx, orch.tmuxCommand, "display-message", "-p", "-t", t, "#{pane_id}")
+		if err := cmd.Run(); err == nil {
+			return true
+		}
+	}
+	return false
+}
+
+func (orch *TmuxOrchestrator) recoverMissingPane(panelID, panelType string) (string, error) {
+	log.Printf("[TMUX] Attempting pane recovery for %s (%s)", panelID, panelType)
+	if orch.layout != nil {
+		if err := orch.ReloadLayout(); err != nil {
+			return "", err
+		}
+	} else {
+		if err := orch.resetTmuxWindow(); err != nil {
+			return "", err
+		}
+		if err := orch.configureDefaultPanels(); err != nil {
+			return "", err
+		}
+	}
+	return orch.getPaneTarget(panelID, panelType), nil
+}
+
+func (orch *TmuxOrchestrator) paneMatchesApp(paneTarget, appName string) bool {
+	target := orch.normalizePaneTarget(paneTarget)
+	if strings.TrimSpace(target) == "" {
+		return false
+	}
+	cmd := exec.CommandContext(orch.ctx, orch.tmuxCommand, "display-message", "-p", "-t", target, "#{pane_current_command}")
+	output, err := cmd.Output()
+	if err != nil {
+		return false
+	}
+	current := filepath.Base(strings.TrimSpace(string(output)))
+	if current == "" {
+		return false
+	}
+	for _, expected := range orch.expectedCommandNames(appName) {
+		if current == expected {
+			return true
+		}
+	}
+	return false
+}
+
+func (orch *TmuxOrchestrator) expectedCommandNames(appName string) []string {
+	names := []string{}
+	if base := filepath.Base(appName); base != "" {
+		names = append(names, base)
+	}
+	if binary, err := orch.getBinaryPath(appName); err == nil {
+		if b := filepath.Base(binary); b != "" {
+			names = append(names, b)
+		}
+	}
+	return uniqueStrings(names)
+}
+
+func (orch *TmuxOrchestrator) fullWindowRecovery() error {
+	if err := orch.resetTmuxWindow(); err != nil {
+		return err
+	}
+
+	if orch.layout != nil {
+		if err := orch.configurePanelsFromConfig(); err != nil {
+			return err
+		}
+		return orch.startConfigPanelApplications()
+	}
+
+	if err := orch.configureDefaultPanels(); err != nil {
+		return err
+	}
+	return orch.startDefaultPanelApplications()
+}
+
+func uniqueStrings(values []string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(values))
+	result := make([]string, 0, len(values))
+	for _, v := range values {
+		if v == "" {
+			continue
+		}
+		if _, ok := seen[v]; ok {
+			continue
+		}
+		seen[v] = struct{}{}
+		result = append(result, v)
+	}
+	return result
+}
+
+func extractPanelConnectionInfo(data interface{}) (string, string) {
+	if payload, ok := data.(types.PanelConnectionPayload); ok {
+		return payload.PanelID, payload.PanelType
+	}
+	if payloadMap, ok := data.(map[string]interface{}); ok {
+		var panelID, panelType string
+		if v, exists := payloadMap["panel_id"]; exists {
+			if s, ok := v.(string); ok {
+				panelID = s
+			}
+		}
+		if v, exists := payloadMap["panel_type"]; exists {
+			if s, ok := v.(string); ok {
+				panelType = s
+			}
+		}
+		return panelID, panelType
+	}
+	return "", ""
+}
+
+func (orch *TmuxOrchestrator) getPaneTarget(panelID, panelType string) string {
+	orch.layoutMutex.Lock()
+	defer orch.layoutMutex.Unlock()
+
+	if panelID != "" {
+		if target, ok := orch.panes[panelID]; ok {
+			return target
+		}
+	}
+	if panelType != "" {
+		if target, ok := orch.panes[panelType]; ok {
+			return target
+		}
+	}
+
+	sessionTarget := orch.sessionName + ":0"
+	switch strings.ToLower(panelType) {
+	case "sessions":
+		return sessionTarget + ".0"
+	case "messages":
+		return sessionTarget + ".1"
+	case "input":
+		return sessionTarget + ".2"
+	}
+	if panelID != "" {
+		if target, ok := orch.panes[panelID]; ok {
+			return target
+		}
+	}
+	return ""
+}
+
+func (orch *TmuxOrchestrator) updatePaneTarget(panelID, panelType, target string) {
+	target = orch.normalizePaneTarget(target)
+	if strings.TrimSpace(target) == "" {
+		return
+	}
+	orch.layoutMutex.Lock()
+	logged := map[string]string{}
+	if panelID != "" {
+		orch.panes[panelID] = target
+		logged[panelID] = target
+	}
+	if panelType != "" {
+		orch.panes[panelType] = target
+		logged[panelType] = target
+	}
+	orch.layoutMutex.Unlock()
+	if len(logged) > 0 {
+		orch.logPaneAssignments("update", logged)
+	}
+}
+
+func (orch *TmuxOrchestrator) getPanelAppName(panelID, panelType string) (string, error) {
+	if orch.layout != nil {
+		for _, panel := range orch.layout.Panels {
+			if panel.ID == panelID || (panelID == "" && strings.EqualFold(panel.Type, panelType)) {
+				return resolvePanelAppName(panel)
+			}
+		}
+	}
+
+	switch strings.ToLower(panelType) {
+	case "sessions", "opencode-sessions":
+		return "opencode-sessions", nil
+	case "messages", "opencode-messages":
+		return "opencode-messages", nil
+	case "input", "opencode-input":
+		return "opencode-input", nil
+	}
+
+	switch panelID {
+	case "sessions":
+		return "opencode-sessions", nil
+	case "messages":
+		return "opencode-messages", nil
+	case "input":
+		return "opencode-input", nil
+	}
+
+	return "", fmt.Errorf("unknown app for panel %s (%s)", panelID, panelType)
+}
+
+func (orch *TmuxOrchestrator) startPaneSupervisor(paneTarget, appName string, envVars map[string]string) {
+	// Copy env vars to avoid later mutation
+	envCopy := cloneStringMap(envVars)
+	orch.paneSupervisorMu.Lock()
+	if cancel, exists := orch.paneSupervisors[paneTarget]; exists {
+		cancel()
+	}
+	supervisorCtx, cancel := context.WithCancel(orch.ctx)
+	orch.paneSupervisors[paneTarget] = cancel
+	orch.paneSupervisorMu.Unlock()
+
+	go orch.monitorPane(supervisorCtx, paneTarget, appName, envCopy)
+}
+
+func (orch *TmuxOrchestrator) monitorPane(ctx context.Context, paneTarget, appName string, envVars map[string]string) {
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+	retryDelay := time.Second
+	const maxDelay = 30 * time.Second
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			alive, err := orch.isPaneAlive(paneTarget)
+			if err != nil {
+				log.Printf("[DEBUG] Failed to read pane %s status: %v", paneTarget, err)
+				continue
+			}
+			if alive {
+				retryDelay = time.Second
+				continue
+			}
+
+			log.Printf("[WARN] Pane %s for %s is not running; attempting restart", paneTarget, appName)
+			if err := orch.launchPaneProcess(paneTarget, appName, envVars); err != nil {
+				log.Printf("[ERROR] Failed to restart pane %s: %v", paneTarget, err)
+				time.Sleep(retryDelay)
+				retryDelay *= 2
+				if retryDelay > maxDelay {
+					retryDelay = maxDelay
+				}
+				continue
+			}
+			retryDelay = time.Second
+		}
+	}
+}
+
+func (orch *TmuxOrchestrator) buildPaneCommand(run string, envVars map[string]string) string {
+	assignments := make([]string, 0, len(envVars))
+	keys := make([]string, 0, len(envVars))
+	for key := range envVars {
+		if envVars[key] == "" {
+			continue
+		}
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		value := envVars[key]
+		assignments = append(assignments, fmt.Sprintf("%s=%s", key, shellEscape(value)))
+	}
+
+	inner := shellEscape("exec " + run)
+	if len(assignments) > 0 {
+		return fmt.Sprintf("env %s sh -lc %s", strings.Join(assignments, " "), inner)
+	}
+	return fmt.Sprintf("sh -lc %s", inner)
+}
+
+func (orch *TmuxOrchestrator) waitForPaneProcess(paneTarget string, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		alive, err := orch.isPaneAlive(paneTarget)
+		if err == nil && alive {
+			return true
+		}
+		if err != nil {
+			log.Printf("[DEBUG] Checking pane %s status failed: %v", paneTarget, err)
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	return false
+}
+
+func (orch *TmuxOrchestrator) isPaneAlive(paneTarget string) (bool, error) {
+	cmd := exec.CommandContext(orch.ctx, orch.tmuxCommand, "display-message", "-p", "-t", paneTarget, "#{pane_dead}")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return false, err
+	}
+	return strings.TrimSpace(string(output)) == "0", nil
+}
+
+func cloneStringMap(src map[string]string) map[string]string {
+	if len(src) == 0 {
+		return map[string]string{}
+	}
+	copy := make(map[string]string, len(src))
+	for key, value := range src {
+		copy[key] = value
+	}
+	return copy
+}
+
+func shellEscape(value string) string {
+	if value == "" {
+		return "''"
+	}
+	return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
 }
 
 // getBinaryPath returns the correct binary path for a panel application
@@ -1002,7 +1495,8 @@ func (orch *TmuxOrchestrator) verifyPanelsRunning() bool {
 	}
 
 	panelsRunning := 0
-	for idx, paneTarget := range targets {
+	for idx, rawTarget := range targets {
+		paneTarget := orch.normalizePaneTarget(rawTarget)
 		cmd := exec.Command(orch.tmuxCommand, "list-panes", "-t", paneTarget, "-F", "#{pane_pid}")
 		output, err := cmd.Output()
 		if err == nil && len(output) > 0 {
@@ -1110,6 +1604,7 @@ func (orch *TmuxOrchestrator) ReloadLayout() error {
 	// Update orchestrator state.
 	orch.layout = layoutCfg
 	orch.panes = newPaneMap
+	orch.logPaneAssignments("reload_layout", orch.panes)
 
 	if err := orch.startMissingPanels(layoutCfg, newPaneMap, movedPanels); err != nil {
 		log.Printf("Warning: failed to start all new panels after layout reload: %v", err)
@@ -1187,7 +1682,7 @@ func (orch *TmuxOrchestrator) startMissingPanels(layoutCfg *tmuxconfig.Layout, p
 	}
 
 	if len(errs) > 0 {
-		return fmt.Errorf(strings.Join(errs, "; "))
+		return errors.New(strings.Join(errs, "; "))
 	}
 	return nil
 }

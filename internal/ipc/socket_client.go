@@ -260,7 +260,7 @@ func (client *SocketClient) SendStateUpdateAndWait(update types.StateUpdate) (in
 		if response.Type == "state_update_error" {
 			if responseData, ok := response.Data.(map[string]interface{}); ok {
 				if errorMsg, ok := responseData["error"].(string); ok {
-					return 0, fmt.Errorf(errorMsg)
+					return 0, errors.New(errorMsg)
 				}
 			}
 		}
@@ -302,7 +302,7 @@ func (client *SocketClient) SendClearSessionMessages(sessionID string) error {
 	if response.Type == "error" {
 		if responseData, ok := response.Data.(map[string]interface{}); ok {
 			if errorMsg, ok := responseData["error"].(string); ok {
-				return fmt.Errorf(errorMsg)
+				return errors.New(errorMsg)
 			}
 		}
 		return fmt.Errorf("unknown error clearing messages")
@@ -349,7 +349,7 @@ func (client *SocketClient) SendOrchestratorCommand(command string) error {
 			return nil
 		}
 		if errMsg, ok := respData["error"].(string); ok && errMsg != "" {
-			return fmt.Errorf(errMsg)
+			return errors.New(errMsg)
 		}
 	}
 
