@@ -1,4 +1,4 @@
-# tmux_coder
+# TmuxCoder
 
 [![Go Version](https://img.shields.io/badge/go-%3E%3D1.24-blue.svg)](https://golang.org/)
 [![tmux](https://img.shields.io/badge/tmux-%3E%3D3.2-green.svg)](https://github.com/tmux/tmux)
