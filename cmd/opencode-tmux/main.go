@@ -24,7 +24,9 @@ import (
 	tmuxconfig "github.com/opencode/tmux_coder/internal/config"
 	"github.com/opencode/tmux_coder/internal/ipc"
 	panelregistry "github.com/opencode/tmux_coder/internal/panel"
+	"github.com/opencode/tmux_coder/internal/paths"
 	"github.com/opencode/tmux_coder/internal/persistence"
+	"github.com/opencode/tmux_coder/internal/session"
 	"github.com/opencode/tmux_coder/internal/state"
 	"github.com/opencode/tmux_coder/internal/theme"
 	"github.com/opencode/tmux_coder/internal/types"
@@ -56,6 +58,7 @@ type TmuxOrchestrator struct {
 	layoutMutex      sync.Mutex
 	paneSupervisorMu sync.Mutex
 	paneSupervisors  map[string]context.CancelFunc
+	lock             *session.SessionLock
 }
 
 // NewTmuxOrchestrator creates a new tmux orchestrator
@@ -131,6 +134,8 @@ func (orch *TmuxOrchestrator) Start() error {
 
 	sessionExists := orch.sessionExists()
 
+	needsConfiguration := false
+
 	if sessionExists {
 		if orch.forceNewSession {
 			if err := orch.killTmuxSession(); err != nil {
@@ -141,6 +146,7 @@ func (orch *TmuxOrchestrator) Start() error {
 			if err := orch.resetTmuxWindow(); err != nil {
 				return fmt.Errorf("failed to prepare existing session: %w", err)
 			}
+			needsConfiguration = true // Reuse requires reconfiguration
 		} else {
 			if err := orch.killTmuxSession(); err != nil {
 				return fmt.Errorf("failed to stop existing session: %w", err)
@@ -154,12 +160,13 @@ func (orch *TmuxOrchestrator) Start() error {
 		if err := orch.createTmuxSession(); err != nil {
 			return fmt.Errorf("failed to create tmux session: %w", err)
 		}
+		needsConfiguration = true // New session requires configuration
 	}
 
 	if orch.serverOnly {
 		log.Printf("Server-only mode: skipping panel configuration and applications")
-	} else {
-		// Configure panels
+	} else if needsConfiguration {
+		// Configure panels (for new sessions or reused sessions)
 		if err := orch.configurePanels(); err != nil {
 			return fmt.Errorf("failed to configure panels: %w", err)
 		}
@@ -1750,6 +1757,9 @@ func (orch *TmuxOrchestrator) waitForShutdown() {
 
 // monitorHealth monitors the health of the system
 func (orch *TmuxOrchestrator) monitorHealth() {
+	// Start tmux session watcher in background
+	go orch.watchTmuxSession()
+
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 
@@ -1759,6 +1769,29 @@ func (orch *TmuxOrchestrator) monitorHealth() {
 			return
 		case <-ticker.C:
 			orch.performHealthCheck()
+		}
+	}
+}
+
+// watchTmuxSession polls tmux has-session to detect session exit quickly
+func (orch *TmuxOrchestrator) watchTmuxSession() {
+	for {
+		select {
+		case <-orch.ctx.Done():
+			return
+		default:
+			cmd := exec.Command(orch.tmuxCommand, "has-session", "-t", orch.sessionName)
+			if err := cmd.Run(); err != nil {
+				log.Printf("Tmux session '%s' no longer exists, shutting down", orch.sessionName)
+				// Release lock immediately so new process can start
+				if orch.lock != nil {
+					orch.lock.Release()
+					orch.lock = nil
+				}
+				orch.cancel()
+				return
+			}
+			time.Sleep(1 * time.Second)
 		}
 	}
 }
@@ -1775,9 +1808,10 @@ func (orch *TmuxOrchestrator) performHealthCheck() {
 		log.Printf("Warning: IPC server is not running")
 	}
 
-	// Check tmux session
+	// Check tmux session - exit if tmux session is gone
 	if orch.isRunning && !orch.isTmuxSessionRunning() {
-		log.Printf("Warning: Tmux session is not running")
+		log.Printf("Tmux session '%s' no longer exists, shutting down orchestrator", orch.sessionName)
+		orch.cancel() // Trigger graceful shutdown
 	}
 }
 
@@ -1857,6 +1891,51 @@ func (orch *TmuxOrchestrator) printStatus() {
 	}
 }
 
+func firstPositionalArg(args []string) (string, bool) {
+	for idx, arg := range args {
+		if arg == "--" {
+			if idx+1 < len(args) {
+				next := args[idx+1]
+				if next != "" {
+					return next, true
+				}
+			}
+			return "", false
+		}
+		if strings.HasPrefix(arg, "-") {
+			continue
+		}
+		if arg != "" {
+			return arg, true
+		}
+	}
+	return "", false
+}
+
+func sanitizeLogComponent(name string) string {
+	if name == "" {
+		return "opencode"
+	}
+	var builder strings.Builder
+	builder.Grow(len(name))
+	for _, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z',
+			r >= 'A' && r <= 'Z',
+			r >= '0' && r <= '9':
+			builder.WriteRune(r)
+		case r == '-', r == '_', r == '.':
+			builder.WriteRune(r)
+		default:
+			builder.WriteByte('_')
+		}
+	}
+	if builder.Len() == 0 {
+		return "opencode"
+	}
+	return builder.String()
+}
+
 func main() {
 	// Configure logging to file
 	logFileHomeDir, err := os.UserHomeDir()
@@ -1867,7 +1946,18 @@ func main() {
 	if err := os.MkdirAll(logDir, 0755); err != nil {
 		log.Fatalf("Failed to create log directory: %v", err)
 	}
-	logPath := filepath.Join(logDir, "tmux.log")
+
+	// Parse session name early for logging
+	sessionName := "opencode"
+	if positional, ok := firstPositionalArg(os.Args[1:]); ok {
+		sessionName = positional
+	}
+	// Note: We can't fully load config yet as we haven't parsed flags,
+	// but we need to setup logging early. We'll use the CLI arg or default
+	// for the log name. If it changes later (e.g. from config), the log
+	// name will remain as started, which is acceptable.
+
+	logPath := filepath.Join(logDir, fmt.Sprintf("tmux-%s.log", sanitizeLogComponent(sessionName)))
 	logFile, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		log.Fatalf("Failed to open log file: %v", err)
@@ -1909,10 +1999,11 @@ func main() {
 		log.Fatal("cannot combine --reload-layout with --attach-only")
 	}
 
-	sessionName := "opencode"
 	sessionOverride := false
 	if flag.NArg() > 0 {
 		sessionName = flag.Arg(0)
+		sessionOverride = true
+	} else if sessionName != "opencode" {
 		sessionOverride = true
 	}
 
@@ -1937,16 +2028,42 @@ func main() {
 		log.Fatalf("Failed to load tmux session config: %v", err)
 	}
 
-	socketPath := os.Getenv("OPENCODE_SOCKET")
-	if socketPath == "" {
-		socketPath = filepath.Join(homeDir, ".opencode", "ipc.sock")
+	// === Per-Session Architecture: Use session name from command line ===
+	// The sessionName variable (from flag.Arg(0)) is the target tmux session name
+	// We'll use this to create per-session isolated paths
+
+	// Environment variables for explicit path override (optional)
+	envSocketPath := os.Getenv("OPENCODE_SOCKET")
+	envStatePath := os.Getenv("OPENCODE_STATE")
+
+	var socketPath, statePath string
+	var lock *session.SessionLock
+
+	// Create path manager based on the target tmux session name
+	pathMgr := paths.NewPathManager(sessionName)
+	log.Printf("Managing tmux session: %s", sessionName)
+
+	// Ensure all necessary directories exist
+	if err := pathMgr.EnsureDirectories(); err != nil {
+		log.Fatalf("Failed to create directories: %v", err)
 	}
 
-	statePath := os.Getenv("OPENCODE_STATE")
-	if statePath == "" {
-		statePath = filepath.Join(homeDir, ".opencode", "state.json")
+	// Cleanup stale files (files older than 7 days from zombie processes)
+	if err := pathMgr.CleanupStaleFiles(7 * 24 * time.Hour); err != nil {
+		log.Printf("Warning: failed to cleanup stale files: %v", err)
 	}
 
+	// Determine socket path early (needed for reload-layout command)
+	if envSocketPath != "" {
+		socketPath = envSocketPath
+		log.Printf("Socket path (from env): %s", socketPath)
+	} else {
+		socketPath = pathMgr.SocketPath()
+		log.Printf("Socket path (per-session): %s", socketPath)
+	}
+
+	// Handle reload-layout command BEFORE acquiring lock
+	// (orchestrator is already running, so we send IPC message and exit)
 	if reloadLayoutFlag {
 		if !sessionOverride {
 			name := strings.TrimSpace(sessionCfg.Session.Name)
@@ -1960,6 +2077,30 @@ func main() {
 		}
 		fmt.Println("Reload layout command sent successfully.")
 		return
+	}
+
+	// Prevent duplicate startup: acquire session lock
+	lock, err = session.AcquireLock(pathMgr.PIDPath())
+	if err != nil {
+		if err == session.ErrAlreadyRunning {
+			log.Fatalf("Orchestrator already running for tmux session '%s'\nPID file: %s",
+				sessionName, pathMgr.PIDPath())
+		}
+		log.Fatalf("Failed to acquire lock: %v", err)
+	}
+	defer func() {
+		if lock != nil {
+			lock.Release()
+		}
+	}()
+	log.Printf("Lock acquired: %s", pathMgr.PIDPath())
+
+	if envStatePath != "" {
+		statePath = envStatePath
+		log.Printf("State path (from env): %s", statePath)
+	} else {
+		statePath = pathMgr.StatePath()
+		log.Printf("State path (per-session): %s", statePath)
 	}
 
 	layoutCfg, err := tmuxconfig.LoadLayout(configPath)
@@ -1987,6 +2128,7 @@ func main() {
 
 	// Create orchestrator
 	orchestrator := NewTmuxOrchestrator(sessionName, socketPath, statePath, serverURL, httpClient, serverOnly, layoutCfg, reuseSessionFlag, forceNewSessionFlag, attachOnlyFlag, configPath)
+	orchestrator.lock = lock
 
 	if err := orchestrator.prepareExistingSession(); err != nil {
 		log.Fatal(err)
@@ -2072,8 +2214,20 @@ func (orch *TmuxOrchestrator) startSSEClient() error {
 					log.Printf("Event stream error: %v", err)
 				}
 				_ = stream.Close()
-				log.Printf("Event stream closed; retrying in 5 seconds...")
-				time.Sleep(5 * time.Second)
+
+				// Check if we're shutting down before retrying
+				select {
+				case <-orch.ctx.Done():
+					log.Printf("Event stream stopping due to context cancellation")
+					return
+				default:
+					log.Printf("Event stream closed; retrying in 5 seconds...")
+					select {
+					case <-orch.ctx.Done():
+						return
+					case <-time.After(5 * time.Second):
+					}
+				}
 			}
 		}
 	}()
@@ -2449,125 +2603,142 @@ func mergeStreamingText(current, incoming string) string {
 	return current + incoming[overlap:]
 }
 
-// loadSessionsFromServer loads existing sessions from OpenCode server into local state
+// loadSessionsFromServer syncs local sessions with OpenCode server
+// Only syncs sessions that already exist in local state (for session isolation in multi-orchestrator architecture)
 func (orch *TmuxOrchestrator) loadSessionsFromServer() error {
-	log.Printf("Loading existing sessions from OpenCode server...")
+	log.Printf("Syncing sessions with OpenCode server...")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
+	// Get current local state to determine which sessions belong to this tmux session
+	localState := orch.syncManager.GetState()
+	localSessionIDs := make(map[string]bool)
+	for _, s := range localState.Sessions {
+		localSessionIDs[s.ID] = true
+	}
+
+	// If no local sessions exist, this is a fresh tmux session - don't load any server sessions
+	if len(localSessionIDs) == 0 {
+		log.Printf("No local sessions found - this tmux session will start fresh")
+		return nil
+	}
+
+	log.Printf("Found %d local sessions to sync", len(localSessionIDs))
+
 	// Get sessions from server
 	sessions, err := orch.httpClient.Session.List(ctx, opencode.SessionListParams{})
-
 	if err != nil {
 		return fmt.Errorf("failed to list sessions from server: %w", err)
 	}
 
 	if sessions == nil || len(*sessions) == 0 {
-		log.Printf("No existing sessions found on server")
+		log.Printf("No sessions found on server")
 		return nil
 	}
 
-	log.Printf("Found %d existing sessions on server", len(*sessions))
+	log.Printf("Found %d sessions on server, filtering to local sessions only", len(*sessions))
 
-	// Convert server sessions to local session format and add to state
+	// Only sync sessions that exist in local state (belonging to this tmux session)
 	for _, serverSession := range *sessions {
+		// Skip sessions that don't belong to this tmux session
+		if !localSessionIDs[serverSession.ID] {
+			log.Printf("Skipping session %s (not owned by this tmux session)", serverSession.ID)
+			continue
+		}
+
 		sessionInfo := state.SessionInfo{
 			ID:           serverSession.ID,
 			Title:        serverSession.Title,
 			CreatedAt:    parseServerTime(serverSession.Time.Created),
 			UpdatedAt:    parseServerTime(serverSession.Time.Updated),
-			MessageCount: 0, // We'd need to call message endpoint to get count
+			MessageCount: 0,
 			IsActive:     true,
 		}
 
-		// Add the session through the sync manager
+		// Update the session through the sync manager
 		if err := orch.syncManager.AddSession(sessionInfo, "server-sync"); err != nil {
-			log.Printf("Warning: Failed to add session %s to local state: %v", serverSession.ID, err)
+			log.Printf("Warning: Failed to sync session %s: %v", serverSession.ID, err)
 			continue
 		}
 
-		log.Printf("Loaded session: %s (%s)", sessionInfo.Title, sessionInfo.ID)
+		log.Printf("Synced session: %s (%s)", sessionInfo.Title, sessionInfo.ID)
 	}
 
-	// After loading sessions, eagerly load message history for each session so
-	// the messages panel shows content on startup and session counts are correct.
-	for _, serverSession := range *sessions {
-		sid := serverSession.ID
-		msgs, err := orch.httpClient.Session.Messages(ctx, sid, opencode.SessionMessagesParams{})
-		if err != nil {
-			log.Printf("Warning: Failed to load messages for session %s: %v", sid, err)
-			continue
-		}
-		if msgs == nil || len(*msgs) == 0 {
-			log.Printf("No messages found for session %s", sid)
-			continue
-		}
-
-		for _, m := range *msgs {
-			var messageType string
-			var contentParts []string
-
-			switch info := m.Info.AsUnion().(type) {
-			case opencode.UserMessage:
-				messageType = "user"
-			case opencode.AssistantMessage:
-				messageType = "assistant"
-				_ = info // suppress unused in switch
-			default:
-				messageType = "system"
-			}
-
-			for _, part := range m.Parts {
-				if textPart, ok := part.AsUnion().(opencode.TextPart); ok {
-					contentParts = append(contentParts, textPart.Text)
-				}
-			}
-
-			mi := types.MessageInfo{
-				ID:        m.Info.ID,
-				SessionID: sid,
-				Type:      messageType,
-				Content:   strings.Join(contentParts, "\n"),
-				Timestamp: time.Now(),
-				Status:    "completed",
-			}
-
-			if err := orch.syncManager.AddMessage(mi, "server-sync"); err != nil {
-				log.Printf("Warning: Failed to add message %s for session %s: %v", mi.ID, sid, err)
-			}
-		}
-	}
-
-	// Ensure CurrentSessionID is valid
+	// First, ensure CurrentSessionID is valid before loading messages
+	// This ensures proper session isolation in multi-orchestrator architecture.
 	st := orch.syncManager.GetState()
+	currentSessionID := ""
 	if len(st.Sessions) > 0 {
-		validSessionID := ""
-
 		// Prefer existing CurrentSessionID if it exists in loaded sessions
 		if st.CurrentSessionID != "" {
 			for _, s := range st.Sessions {
 				if s.ID == st.CurrentSessionID {
-					validSessionID = st.CurrentSessionID
-					log.Printf("Keeping existing session selection: %s", validSessionID)
+					currentSessionID = st.CurrentSessionID
+					log.Printf("Keeping existing session selection: %s", currentSessionID)
 					break
 				}
 			}
 		}
 
 		// If current ID is invalid or empty, select the first session
-		if validSessionID == "" {
-			validSessionID = st.Sessions[0].ID
-			log.Printf("Setting session to first available: %s", validSessionID)
+		if currentSessionID == "" {
+			currentSessionID = st.Sessions[0].ID
+			log.Printf("Setting session to first available: %s", currentSessionID)
 
-			if err := orch.syncManager.UpdateSessionSelection(validSessionID, "server-sync"); err != nil {
+			if err := orch.syncManager.UpdateSessionSelection(currentSessionID, "server-sync"); err != nil {
 				log.Printf("Warning: failed to set session selection: %v", err)
 			} else {
-				log.Printf("Successfully set CurrentSessionID: %s", validSessionID)
+				log.Printf("Successfully set CurrentSessionID: %s", currentSessionID)
 			}
 		}
 	} else {
 		log.Printf("No sessions loaded from server, CurrentSessionID will remain empty")
+	}
+
+	// Now load message history ONLY for the current session
+	if currentSessionID != "" {
+		log.Printf("Loading messages only for current session: %s", currentSessionID)
+		msgs, err := orch.httpClient.Session.Messages(ctx, currentSessionID, opencode.SessionMessagesParams{})
+		if err != nil {
+			log.Printf("Warning: Failed to load messages for session %s: %v", currentSessionID, err)
+		} else if msgs != nil && len(*msgs) > 0 {
+			for _, m := range *msgs {
+				var messageType string
+				var contentParts []string
+
+				switch info := m.Info.AsUnion().(type) {
+				case opencode.UserMessage:
+					messageType = "user"
+				case opencode.AssistantMessage:
+					messageType = "assistant"
+					_ = info // suppress unused in switch
+				default:
+					messageType = "system"
+				}
+
+				for _, part := range m.Parts {
+					if textPart, ok := part.AsUnion().(opencode.TextPart); ok {
+						contentParts = append(contentParts, textPart.Text)
+					}
+				}
+
+				mi := types.MessageInfo{
+					ID:        m.Info.ID,
+					SessionID: currentSessionID,
+					Type:      messageType,
+					Content:   strings.Join(contentParts, "\n"),
+					Timestamp: time.Now(),
+					Status:    "completed",
+				}
+
+				if err := orch.syncManager.AddMessage(mi, "server-sync"); err != nil {
+					log.Printf("Warning: Failed to add message %s for session %s: %v", mi.ID, currentSessionID, err)
+				}
+			}
+		} else {
+			log.Printf("No messages found for session %s", currentSessionID)
+		}
 	}
 
 	// Log final state for debugging

@@ -4,683 +4,231 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-ALL_ARGS=("$@")
 
 function usage() {
   cat <<'EOF'
 Usage: scripts/start.sh [options] [-- <opencode-tmux args>]
 
 Options:
-  --skip-build       Skip the Go build step and run existing binaries
-  --server <URL>     Set OPENCODE_SERVER (default http://127.0.0.1:62435)
-  --panels <list>    Build only the specified panels, comma separated (sessions,messages,input)
-  --attach-only      Attach to an existing tmux session without restarting panels
-  --reload-layout    Send a hot reload layout command to the running tmux session
-  --session <name>   With --reload-layout, target a specific managed tmux session
+  --skip-build       Skip the Go build step
+  --server <URL>     Set OPENCODE_SERVER (default auto-start on 127.0.0.1:55306)
+  --attach-only      Attach to existing tmux session only
   -h, --help         Show this help message
-
-Other arguments are forwarded to opencode-tmux, e.g. to add --server-only.
 EOF
 }
 
 SKIP_BUILD=0
-SERVER_URL="${OPENCODE_SERVER:-http://127.0.0.1:62435}"
-REQUESTED_PANELS=""
+SERVER_URL="${OPENCODE_SERVER:-}"
 ATTACH_ONLY=0
-RELOAD_LAYOUT=0
-SESSION_OVERRIDE_RAW=""
-RELOAD_TARGET_SESSION=""
 declare -a FORWARD_ARGS=()
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --skip-build)
-      SKIP_BUILD=1
-      shift
-      ;;
+    --skip-build) SKIP_BUILD=1; shift ;;
     --server)
-      if [[ $# -lt 2 ]]; then
-        echo "Error: --server requires a URL" >&2
-        exit 1
-      fi
-      SERVER_URL="$2"
-      shift 2
-      ;;
-    --panels)
-      if [[ $# -lt 2 ]]; then
-        echo "Error: --panels requires a comma-separated list of panels, e.g. sessions,messages,input" >&2
-        exit 1
-      fi
-      REQUESTED_PANELS="$2"
-      shift 2
-      ;;
-    --attach-only)
-      ATTACH_ONLY=1
-      FORWARD_ARGS+=("--attach-only")
-      shift
-      ;;
-    --reload-layout)
-      RELOAD_LAYOUT=1
-      FORWARD_ARGS+=("--reload-layout")
-      shift
-      ;;
-    --session)
-      if [[ $# -lt 2 ]]; then
-        echo "Error: --session requires a session name or suffix" >&2
-        exit 1
-      fi
-      SESSION_OVERRIDE_RAW="$2"
-      shift 2
-      ;;
-    -h|--help)
-      usage
-      exit 0
-      ;;
-    --)
-      shift
-      FORWARD_ARGS+=("$@")
-      break
-      ;;
-    *)
-      FORWARD_ARGS+=("$1")
-      shift
-      ;;
+      [[ $# -lt 2 ]] && { echo "Error: --server requires a URL" >&2; exit 1; }
+      SERVER_URL="$2"; shift 2 ;;
+    --attach-only) ATTACH_ONLY=1; FORWARD_ARGS+=("--attach-only"); shift ;;
+    -h|--help) usage; exit 0 ;;
+    --) shift; FORWARD_ARGS+=("$@"); break ;;
+    *) FORWARD_ARGS+=("$1"); shift ;;
   esac
 done
 
-if [[ $ATTACH_ONLY -eq 1 || $RELOAD_LAYOUT -eq 1 ]]; then
-  SKIP_BUILD=1
-fi
+[[ $ATTACH_ONLY -eq 1 ]] && SKIP_BUILD=1
 
-if [[ -n "$SESSION_OVERRIDE_RAW" && $RELOAD_LAYOUT -eq 0 ]]; then
-  echo "Error: --session is only valid together with --reload-layout" >&2
-  exit 1
-fi
-
+# Session config
 SESSION_PREFIX="tmux-coder"
-SESSION_SUFFIX_PATTERN='^[A-Za-z0-9_-]+$'
-SESSION_DELIMITER="-"
-SESSION_DISPLAY_DELIMITER=":"
-SESSION_NAME_PREFIX="${SESSION_PREFIX}${SESSION_DELIMITER}"
-SESSION_STATE_FILE=""
-SESSION_STATE_TMP=""
-USER_ABORTED=0
-PERFORM_CLEANUP=0
-SESSION_ACTION=""
 SELECTED_SESSION=""
-declare -a STATE_SESSIONS
-declare -a LIVE_SESSIONS
-declare -a CURRENT_SESSIONS
-STATE_SESSIONS=()
-LIVE_SESSIONS=()
-CURRENT_SESSIONS=()
+SESSION_ACTION=""
 
-trim_whitespace() {
-  local value="$1"
-  # Use sed for portability with bash 3.2
-  printf '%s' "$value" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'
+# Auto server config
+AUTO_SERVER_HOST="127.0.0.1"
+AUTO_SERVER_PORT="${OPENCODE_AUTO_SERVER_PORT:-55306}"
+AUTO_SERVER_URL="http://${AUTO_SERVER_HOST}:${AUTO_SERVER_PORT}"
+AUTO_SERVER_PID=""
+AUTO_SERVER_STARTED=0
+
+# Get managed tmux sessions
+get_sessions() {
+  tmux list-sessions -F '#S' 2>/dev/null | grep "^${SESSION_PREFIX}-" || true
 }
 
-array_contains() {
-  local needle="$1"
-  local array_name="$2"
-  local size=0
-  eval "size=\${#${array_name}[@]}"
-  local idx=0
-  while (( idx < size )); do
-    local value
-    eval "value=\${${array_name}[\$idx]}"
-    if [[ "$value" == "$needle" ]]; then
-      return 0
-    fi
-    idx=$((idx + 1))
+# Generate next session suffix
+next_suffix() {
+  local i=1 sessions
+  sessions="$(get_sessions)"
+  while echo "$sessions" | grep -q "^${SESSION_PREFIX}-${i}$"; do
+    i=$((i + 1))
   done
-  return 1
+  echo "$i"
 }
 
-build_session_name() {
-  local suffix="$1"
-  printf '%s%s%s' "${SESSION_PREFIX}" "${SESSION_DELIMITER}" "$suffix"
-}
+# Prompt for session
+prompt_session() {
+  local sessions count=0
+  sessions="$(get_sessions)"
+  local -a list=()
 
-is_managed_session_name() {
-  local name="$1"
-  [[ "$name" == "${SESSION_NAME_PREFIX}"* ]]
-}
-
-format_display_name() {
-  local full="$1"
-  if ! is_managed_session_name "$full"; then
-    printf '%s' "$full"
-    return 0
-  fi
-  local suffix
-  suffix="$(session_suffix "$full")"
-  printf '%s%s%s' "${SESSION_PREFIX}" "${SESSION_DISPLAY_DELIMITER}" "$suffix"
-}
-
-normalize_session_name() {
-  local raw
-  raw="$(trim_whitespace "$1")"
-  if [[ -z "$raw" ]]; then
-    return 1
-  fi
-  if is_managed_session_name "$raw"; then
-    printf '%s' "$raw"
-    return 0
-  fi
-  local display_prefix="${SESSION_PREFIX}${SESSION_DISPLAY_DELIMITER}"
-  if [[ "$raw" == "$display_prefix"* ]]; then
-    local suffix="${raw#$display_prefix}"
-    if [[ "$suffix" =~ $SESSION_SUFFIX_PATTERN ]]; then
-      printf '%s' "$(build_session_name "$suffix")"
-      return 0
-    fi
-    return 1
-  fi
-  if [[ "$raw" =~ $SESSION_SUFFIX_PATTERN ]]; then
-    printf '%s' "$(build_session_name "$raw")"
-    return 0
-  fi
-  return 1
-}
-
-load_state_sessions() {
-  STATE_SESSIONS=()
-  local file="$1"
-  if [[ ! -f "$file" ]]; then
-    return 0
-  fi
-  while IFS= read -r line || [[ -n "$line" ]]; do
-    [[ -z "$line" ]] && continue
-    if session_normalized="$(normalize_session_name "$line")"; then
-      STATE_SESSIONS+=("$session_normalized")
-    fi
-  done <"$file"
-}
-
-load_live_sessions() {
-  LIVE_SESSIONS=()
-  local output
-  if ! output="$(tmux list-sessions -F '#S' 2>/dev/null)"; then
-    return 0
-  fi
-  while IFS= read -r line || [[ -n "$line" ]]; do
-    [[ -z "$line" ]] && continue
-    if session_normalized="$(normalize_session_name "$line")"; then
-      LIVE_SESSIONS+=("$session_normalized")
-    fi
-  done <<EOF
-$output
-EOF
-}
-
-rebuild_current_sessions() {
-  CURRENT_SESSIONS=()
-  local state_count=${#STATE_SESSIONS[@]}
-  local live_count=${#LIVE_SESSIONS[@]}
-  if (( state_count > 0 && live_count > 0 )); then
-    local idx=0
-    while (( idx < state_count )); do
-      local entry="${STATE_SESSIONS[idx]}"
-      if array_contains "$entry" "LIVE_SESSIONS"; then
-        CURRENT_SESSIONS+=("$entry")
-      fi
-      idx=$((idx + 1))
-    done
-  fi
-  if (( live_count > 0 )); then
-    local idx=0
-    while (( idx < live_count )); do
-      local entry="${LIVE_SESSIONS[idx]}"
-      if ! array_contains "$entry" "CURRENT_SESSIONS"; then
-        CURRENT_SESSIONS+=("$entry")
-      fi
-      idx=$((idx + 1))
-    done
+  if [[ -n "$sessions" ]]; then
+    while IFS= read -r s; do
+      [[ -n "$s" ]] && { list+=("$s"); count=$((count + 1)); }
+    done <<< "$sessions"
   fi
 
-  sort_and_dedupe_current_sessions
-  write_current_sessions_to_file "$SESSION_STATE_FILE" "$SESSION_STATE_TMP"
-}
-
-sort_and_dedupe_current_sessions() {
-  if [[ ${#CURRENT_SESSIONS[@]} -eq 0 ]]; then
-    return 0
-  fi
-  local sorted
-  sorted="$(printf '%s\n' "${CURRENT_SESSIONS[@]}" | LC_ALL=C sort -u)"
-  CURRENT_SESSIONS=()
-  while IFS= read -r line || [[ -n "$line" ]]; do
-    [[ -z "$line" ]] && continue
-    CURRENT_SESSIONS+=("$line")
-  done <<EOF
-$sorted
-EOF
-}
-
-write_current_sessions_to_file() {
-  local file="$1"
-  local tmp="$2"
-  mkdir -p "$(dirname "$file")"
-  : >"$tmp"
-  if [[ ${#CURRENT_SESSIONS[@]} -gt 0 ]]; then
-    for entry in "${CURRENT_SESSIONS[@]}"; do
-      printf '%s\n' "$entry" >>"$tmp"
-    done
-  fi
-  mv "$tmp" "$file"
-}
-
-refresh_state_from_live() {
-  if [[ -z "$SESSION_STATE_FILE" ]]; then
-    return 0
-  fi
-  load_live_sessions
-  CURRENT_SESSIONS=("${LIVE_SESSIONS[@]}")
-  sort_and_dedupe_current_sessions
-  write_current_sessions_to_file "$SESSION_STATE_FILE" "$SESSION_STATE_TMP"
-}
-
-session_suffix() {
-  local full="$1"
-  if [[ "$full" == "${SESSION_NAME_PREFIX}"* ]]; then
-    printf '%s' "${full#${SESSION_NAME_PREFIX}}"
-    return 0
-  fi
-  printf '%s' "$full"
-}
-
-generate_default_suffix() {
-  local index=1
-  while :; do
-    local candidate_suffix="$index"
-    local full_name
-    full_name="$(build_session_name "$candidate_suffix")"
-    if ! array_contains "$full_name" "CURRENT_SESSIONS"; then
-      printf '%s' "$candidate_suffix"
-      return 0
-    fi
-    index=$((index + 1))
-  done
-}
-
-add_session_to_state_if_needed() {
-  local session_name="$1"
-  if array_contains "$session_name" "CURRENT_SESSIONS"; then
-    return 0
-  fi
-  CURRENT_SESSIONS+=("$session_name")
-  sort_and_dedupe_current_sessions
-  write_current_sessions_to_file "$SESSION_STATE_FILE" "$SESSION_STATE_TMP"
-}
-
-prompt_new_session_name() {
-  local default_suffix
-  default_suffix="$(generate_default_suffix)"
-  local default_display
-  default_display="$(format_display_name "$(build_session_name "$default_suffix")")"
-  local input suffix
-  while :; do
-    printf 'Enter new session name suffix (default %s -> %s, allowed [A-Za-z0-9_-]): ' "$default_suffix" "$default_display"
-    if ! IFS= read -r input; then
-      return 1
-    fi
-    input="$(trim_whitespace "$input")"
-    if [[ -z "$input" ]]; then
-      suffix="$default_suffix"
-    else
-      if [[ "$input" == "q" || "$input" == "quit" || "$input" == "!" ]]; then
-        return 1
-      fi
-      if [[ ! "$input" =~ $SESSION_SUFFIX_PATTERN ]]; then
-        echo "Invalid name. Use letters, numbers, underscores, or dashes."
-        continue
-      fi
-      if [[ "$input" == "${SESSION_PREFIX}" ]]; then
-        echo "Suffix must differ from the tmux prefix."
-        continue
-      fi
-      suffix="$input"
-    fi
-    local candidate
-    candidate="$(build_session_name "$suffix")"
-    if array_contains "$candidate" "CURRENT_SESSIONS"; then
-      echo "Session $(format_display_name "$candidate") already exists. Choose another name."
-      continue
-    fi
-    SELECTED_SESSION="$candidate"
-    SESSION_ACTION="create"
-    add_session_to_state_if_needed "$SELECTED_SESSION"
-    return 0
-  done
-}
-
-prompt_session_choice() {
-  local count=${#CURRENT_SESSIONS[@]}
   if [[ $count -eq 0 ]]; then
-    if ! prompt_new_session_name; then
-      return 1
-    fi
+    local suffix
+    suffix="$(next_suffix)"
+    printf 'Enter session suffix (default %s -> %s:%s): ' "$suffix" "$SESSION_PREFIX" "$suffix"
+    read -r input
+    input="${input:-$suffix}"
+    [[ "$input" == "q" ]] && return 1
+    [[ ! "$input" =~ ^[A-Za-z0-9_-]+$ ]] && { echo "Invalid name"; return 1; }
+    SELECTED_SESSION="${SESSION_PREFIX}-${input}"
+    SESSION_ACTION="create"
     return 0
   fi
 
-  echo "Managed tmux sessions:"
-  local idx=1
-  while [[ $idx -le $count ]]; do
-    local session="${CURRENT_SESSIONS[$((idx - 1))]}"
-    local display
-    display="$(format_display_name "$session")"
-    printf '  %d) %s [%s]\n' "$idx" "$display" "$session"
-    idx=$((idx + 1))
+  echo "Sessions:"
+  local i=1
+  for s in "${list[@]}"; do
+    printf '  %d) %s\n' "$i" "$s"
+    i=$((i + 1))
   done
-  printf '  %d) Create new session\n' "$((count + 1))"
+  printf '  %d) Create new\n' "$((count + 1))"
   echo "  q) Quit"
 
   while :; do
-    printf 'Select an option [default 1]: '
-    local choice
-    if ! IFS= read -r choice; then
-      return 1
-    fi
-    choice="$(trim_whitespace "$choice")"
-    if [[ -z "$choice" ]]; then
-      choice="1"
-    fi
-    if [[ "$choice" == "q" || "$choice" == "quit" || "$choice" == "!" ]]; then
-      return 1
-    fi
+    printf 'Select [1]: '
+    read -r choice
+    choice="${choice:-1}"
+    [[ "$choice" == "q" ]] && return 1
+
     if [[ "$choice" =~ ^[0-9]+$ ]]; then
-      local number="$choice"
-      if (( number >= 1 && number <= count )); then
-        SELECTED_SESSION="${CURRENT_SESSIONS[$((number - 1))]}"
-        SESSION_ACTION="attach"
-        return 0
-      fi
-      if (( number == count + 1 )); then
-        if prompt_new_session_name; then
-          return 0
-        fi
-        return 1
-      fi
-    fi
-    echo "Invalid selection."
-  done
-}
-
-prompt_select_existing_session() {
-  local title="$1"
-  local count=${#CURRENT_SESSIONS[@]}
-  if (( count == 0 )); then
-    return 1
-  fi
-
-  echo "$title"
-  local idx=1
-  while (( idx <= count )); do
-    local session="${CURRENT_SESSIONS[$((idx - 1))]}"
-    local display
-    display="$(format_display_name "$session")"
-    printf '  %d) %s [%s]\n' "$idx" "$display" "$session"
-    idx=$((idx + 1))
-  done
-  echo "  q) Quit"
-
-  while :; do
-    printf 'Select a session [default 1]: '
-    local choice
-    if ! IFS= read -r choice; then
-      return 1
-    fi
-    choice="$(trim_whitespace "$choice")"
-    if [[ -z "$choice" ]]; then
-      choice="1"
-    fi
-    if [[ "$choice" == "q" || "$choice" == "quit" || "$choice" == "!" ]]; then
-      return 1
-    fi
-    if [[ "$choice" =~ ^[0-9]+$ ]]; then
-      local number="$choice"
-      if (( number >= 1 && number <= count )); then
-        SELECTED_SESSION="${CURRENT_SESSIONS[$((number - 1))]}"
+      if (( choice >= 1 && choice <= count )); then
+        SELECTED_SESSION="${list[$((choice - 1))]}"
+        echo "Action: r)Reuse a)Attach q)Cancel"
+        while :; do
+          printf '[r/a/q]: '
+          read -r act
+          case "${act:-r}" in
+            r|R) SESSION_ACTION="reuse"; return 0 ;;
+            a|A) SESSION_ACTION="attach"; return 0 ;;
+            q|Q) return 1 ;;
+            *) echo "Invalid" ;;
+          esac
+        done
+      elif (( choice == count + 1 )); then
+        local suffix
+        suffix="$(next_suffix)"
+        printf 'Session suffix [%s]: ' "$suffix"
+        read -r input
+        input="${input:-$suffix}"
+        [[ ! "$input" =~ ^[A-Za-z0-9_-]+$ ]] && { echo "Invalid"; return 1; }
+        SELECTED_SESSION="${SESSION_PREFIX}-${input}"
+        SESSION_ACTION="create"
         return 0
       fi
     fi
-    echo "Invalid selection."
+    echo "Invalid"
   done
 }
 
-prepare_reload_layout_session() {
-  local opencode_home="${OPENCODE_HOME:-${HOME}/.opencode}"
-  SESSION_STATE_FILE="${opencode_home}/opencode_tmux_sessions"
-  SESSION_STATE_TMP="${SESSION_STATE_FILE}.tmp"
+server_ready() {
+  curl -s --max-time 1 "http://${AUTO_SERVER_HOST}:${AUTO_SERVER_PORT}/" >/dev/null 2>&1
+}
 
-  load_state_sessions "$SESSION_STATE_FILE"
-  load_live_sessions
-  rebuild_current_sessions
+start_server() {
+  command -v bun >/dev/null 2>&1 || { echo "Error: bun not found" >&2; exit 1; }
+  local home="${OPENCODE_HOME:-${HOME}/.opencode}"
+  mkdir -p "$home"
+  local log="${home}/opencode-server.log"
 
-  if [[ -n "$SESSION_OVERRIDE_RAW" ]]; then
-    if ! RELOAD_TARGET_SESSION="$(normalize_session_name "$SESSION_OVERRIDE_RAW")"; then
-      echo "Error: invalid session name for --session: $SESSION_OVERRIDE_RAW" >&2
-      echo "Hint: use suffix like '1' or a full name such as 'tmux-coder-1'." >&2
-      exit 1
-    fi
-    if ! array_contains "$RELOAD_TARGET_SESSION" "CURRENT_SESSIONS"; then
-      echo "Error: session ${RELOAD_TARGET_SESSION} is not active." >&2
-      exit 1
-    fi
-    return 0
-  fi
+  pushd "${REPO_ROOT}/packages/opencode" >/dev/null
+  bun run packages/opencode/src/index.ts serve --hostname "$AUTO_SERVER_HOST" --port "$AUTO_SERVER_PORT" >>"$log" 2>&1 &
+  AUTO_SERVER_PID=$!
+  popd >/dev/null
 
-  local count=${#CURRENT_SESSIONS[@]}
-  if (( count == 0 )); then
-    echo "Error: no managed tmux sessions found to reload." >&2
-    echo "Start a session first or provide --session <name>." >&2
-    exit 1
-  fi
-
-  if prompt_select_existing_session "Select a session to reload layout:"; then
-    RELOAD_TARGET_SESSION="$SELECTED_SESSION"
-    return 0
-  fi
-
-  echo "Aborted layout reload." >&2
+  local i=0
+  while (( i < 25 )); do
+    server_ready && { AUTO_SERVER_STARTED=1; echo "==> Started server at ${AUTO_SERVER_URL}"; return 0; }
+    sleep 0.2
+    i=$((i + 1))
+  done
+  echo "Error: Server failed to start" >&2
+  [[ -n "$AUTO_SERVER_PID" ]] && kill "$AUTO_SERVER_PID" 2>/dev/null || true
   exit 1
 }
 
-manage_tmux_sessions() {
-  local opencode_home="${OPENCODE_HOME:-${HOME}/.opencode}"
-  SESSION_STATE_FILE="${opencode_home}/opencode_tmux_sessions"
-  SESSION_STATE_TMP="${SESSION_STATE_FILE}.tmp"
-
-  load_state_sessions "$SESSION_STATE_FILE"
-  load_live_sessions
-
-  rebuild_current_sessions
-
-  if ! prompt_session_choice; then
-    USER_ABORTED=1
-    SESSION_ACTION=""
-    SELECTED_SESSION=""
-    return 1
+maybe_start_server() {
+  if server_ready; then
+    echo "==> Reusing server at ${AUTO_SERVER_URL}"
+  else
+    start_server
   fi
-  return 0
-}
-
-on_interrupt() {
-  USER_ABORTED=1
-  echo ""
-  exit 130
 }
 
 on_exit() {
-  if [[ $PERFORM_CLEANUP -eq 1 ]]; then
-    refresh_state_from_live
+  if [[ $AUTO_SERVER_STARTED -eq 1 && -n "$AUTO_SERVER_PID" ]]; then
+    kill "$AUTO_SERVER_PID" 2>/dev/null || true
+    wait "$AUTO_SERVER_PID" 2>/dev/null || true
   fi
 }
-
-trap on_interrupt INT TERM
 trap on_exit EXIT
+trap 'exit 130' INT TERM
 
-function ensure_command() {
-  local name="$1"
-  local install_hint="$2"
-  if ! command -v "$name" >/dev/null 2>&1; then
-    echo "Error: $name not found. Please install it. Hint: ${install_hint}" >&2
-    exit 1
-  fi
-}
+# Check commands
+command -v go >/dev/null 2>&1 || { echo "Error: go not found" >&2; exit 1; }
+command -v tmux >/dev/null 2>&1 || { echo "Error: tmux not found" >&2; exit 1; }
 
-ensure_command go "https://go.dev/doc/install"
+# Session selection
+prompt_session || exit 0
 
-NEED_TMUX=1
-for arg in "${ALL_ARGS[@]}"; do
-  if [[ "$arg" == "--server-only" ]]; then
-    NEED_TMUX=0
-    break
-  fi
-done
-
-if [[ $NEED_TMUX -eq 1 ]]; then
-  ensure_command tmux "Install tmux via your package manager, e.g. brew install tmux"
-else
-  if ! command -v tmux >/dev/null 2>&1; then
-    echo "Notice: tmux is not installed. --server-only detected, skipping tmux check." >&2
-  fi
-fi
-
-if [[ $NEED_TMUX -eq 1 ]]; then
-  if [[ $RELOAD_LAYOUT -eq 0 ]]; then
-    if ! manage_tmux_sessions; then
-      exit 0
-    fi
-  else
-    prepare_reload_layout_session
-  fi
-fi
-
+# Handle attach
 if [[ "$SESSION_ACTION" == "attach" ]]; then
-  PERFORM_CLEANUP=1
-  display_name="$(format_display_name "$SELECTED_SESSION")"
-  echo "==> Attaching to tmux session ${display_name} [${SELECTED_SESSION}]"
-  if ! tmux attach -t "${SELECTED_SESSION}"; then
-    status=$?
-    echo "Error: failed to attach to ${SELECTED_SESSION}" >&2
-    exit $status
-  fi
-  exit 0
+  echo "==> Attaching to ${SELECTED_SESSION}"
+  tmux attach -t "$SELECTED_SESSION"
+  exit $?
 fi
 
-if [[ "$SESSION_ACTION" == "create" ]]; then
-  PERFORM_CLEANUP=1
+# Start server if needed
+if [[ -z "$SERVER_URL" ]]; then
+  maybe_start_server
+  SERVER_URL="$AUTO_SERVER_URL"
 fi
 
+# Build
 if [[ $SKIP_BUILD -eq 0 ]]; then
-  echo "==> Building tmux panels and scheduler..."
-  BUILD_TARGETS=(
-    "cmd/opencode-tmux:dist/opencode-tmux"
-    "cmd/opencode-sessions:dist/sessions-pane"
-    "cmd/opencode-messages:dist/messages-pane"
-    "cmd/opencode-input:dist/input-pane"
-  )
-
-  declare -a ENABLED_PANELS
-  if [[ -n "$REQUESTED_PANELS" ]]; then
-    IFS=',' read -r -a ENABLED_PANELS <<<"$REQUESTED_PANELS"
-  else
-    ENABLED_PANELS=(sessions messages input)
-  fi
-
-  should_build_panel() {
-    local name="$1"
-    for panel in "${ENABLED_PANELS[@]}"; do
-      if [[ "$panel" == "$name" ]]; then
-        return 0
-      fi
-    done
-    return 1
-  }
-
-  pushd "${REPO_ROOT}" >/dev/null
-  for target in "${BUILD_TARGETS[@]}"; do
-    pkg="${target%%:*}"
-    output_rel="${target#*:}"
-    base="$(basename "$pkg")"
-    panel_name="${base#opencode-}"
-    if [[ "$base" != "opencode-tmux" ]]; then
-      if ! should_build_panel "$panel_name"; then
-        echo "  -> Skipping ${pkg} (not in --panels list)"
-        continue
-      fi
-    fi
-    output="${REPO_ROOT}/${pkg}/${output_rel}"
-    mkdir -p "$(dirname "$output")"
-    echo "  -> go build ./${pkg} -> ${pkg}/${output_rel}"
-    GO111MODULE=on go build -o "$output" "./${pkg}"
+  echo "==> Building..."
+  pushd "$REPO_ROOT" >/dev/null
+  for pkg in cmd/opencode-tmux cmd/opencode-sessions cmd/opencode-messages cmd/opencode-input; do
+    out="$REPO_ROOT/$pkg/dist/$(basename "$pkg" | sed 's/opencode-//')-pane"
+    [[ "$pkg" == "cmd/opencode-tmux" ]] && out="$REPO_ROOT/$pkg/dist/opencode-tmux"
+    mkdir -p "$(dirname "$out")"
+    echo "  -> $pkg"
+    go build -o "$out" "./$pkg"
   done
   popd >/dev/null
-else
-  echo "==> Skipping build step, using existing binaries"
 fi
 
-OPENCODE_HOME="${OPENCODE_HOME:-${HOME}/.opencode}"
-export OPENCODE_SERVER="${SERVER_URL}"
-export OPENCODE_SOCKET="${OPENCODE_SOCKET:-${OPENCODE_HOME}/ipc.sock}"
-export OPENCODE_STATE="${OPENCODE_STATE:-${OPENCODE_HOME}/state.json}"
-export OPENCODE_TMUX_CONFIG="${OPENCODE_TMUX_CONFIG:-${OPENCODE_HOME}/tmux.yaml}"
+# Environment
+export OPENCODE_SERVER="$SERVER_URL"
+export OPENCODE_TMUX_CONFIG="${OPENCODE_TMUX_CONFIG:-${HOME}/.opencode/tmux.yaml}"
 
-mkdir -p "${OPENCODE_HOME}"
-mkdir -p "$(dirname "${OPENCODE_SOCKET}")"
-mkdir -p "$(dirname "${OPENCODE_STATE}")"
-mkdir -p "$(dirname "${OPENCODE_TMUX_CONFIG}")"
+echo "==> Starting opencode-tmux (server: $OPENCODE_SERVER)"
 
-echo "==> Starting opencode-tmux with environment variables"
-echo "  OPENCODE_SERVER=${OPENCODE_SERVER}"
-echo "  OPENCODE_SOCKET=${OPENCODE_SOCKET}"
-echo "  OPENCODE_STATE=${OPENCODE_STATE}"
-echo "  OPENCODE_TMUX_CONFIG=${OPENCODE_TMUX_CONFIG}"
+BIN="${REPO_ROOT}/cmd/opencode-tmux/dist/opencode-tmux"
+[[ ! -x "$BIN" ]] && { echo "Error: $BIN not found" >&2; exit 1; }
 
-BIN_PATH="${REPO_ROOT}/cmd/opencode-tmux/dist/opencode-tmux"
-if [[ ! -x "${BIN_PATH}" ]]; then
-  echo "Error: Executable ${BIN_PATH} not found. Please avoid skipping the build, or verify that the build succeeded." >&2
-  exit 1
+# Build command
+CMD=("$BIN")
+[[ ${#FORWARD_ARGS[@]} -gt 0 ]] && CMD+=("${FORWARD_ARGS[@]}")
+
+if [[ "$SESSION_ACTION" == "reuse" ]]; then
+  CMD+=("--reuse-session" "$SELECTED_SESSION")
+elif [[ "$SESSION_ACTION" == "create" ]]; then
+  echo "==> Creating session ${SELECTED_SESSION}"
+  CMD+=("$SELECTED_SESSION")
 fi
 
-SESSION_FLAG_PRESENT=0
-for arg in "${FORWARD_ARGS[@]+"${FORWARD_ARGS[@]}"}"; do
-  if [[ "$arg" == "--reuse-session" || "$arg" == "--force-new-session" ]]; then
-    SESSION_FLAG_PRESENT=1
-    break
-  fi
-done
-
-if [[ -n "$REQUESTED_PANELS" && $SESSION_FLAG_PRESENT -eq 0 && $ATTACH_ONLY -eq 0 && $RELOAD_LAYOUT -eq 0 && "$SESSION_ACTION" != "create" ]]; then
-  FORWARD_ARGS+=("--reuse-session")
-fi
-
-if [[ "$SESSION_ACTION" == "create" && -n "$SELECTED_SESSION" ]]; then
-  display_name="$(format_display_name "$SELECTED_SESSION")"
-  echo "==> Launching managed tmux session ${display_name} [${SELECTED_SESSION}]"
-fi
-
-if [[ $RELOAD_LAYOUT -eq 1 && -n "$RELOAD_TARGET_SESSION" ]]; then
-  display_name="$(format_display_name "$RELOAD_TARGET_SESSION")"
-  echo "==> Reloading layout for session ${display_name} [${RELOAD_TARGET_SESSION}]"
-fi
-
-CMD=("${BIN_PATH}")
-if [[ ${#FORWARD_ARGS[@]} -gt 0 ]]; then
-  CMD+=("${FORWARD_ARGS[@]}")
-fi
-if [[ "$SESSION_ACTION" == "create" && -n "$SELECTED_SESSION" ]]; then
-  CMD+=("${SELECTED_SESSION}")
-fi
-if [[ $RELOAD_LAYOUT -eq 1 && -n "$RELOAD_TARGET_SESSION" ]]; then
-  CMD+=("${RELOAD_TARGET_SESSION}")
-fi
-
-if ! "${CMD[@]}"; then
-  status=$?
-  exit $status
-fi
-exit 0
+"${CMD[@]}"
