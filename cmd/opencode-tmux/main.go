@@ -1781,9 +1781,10 @@ func (orch *TmuxOrchestrator) performHealthCheck() {
 		log.Printf("Warning: IPC server is not running")
 	}
 
-	// Check tmux session
+	// Check tmux session - exit if tmux session is gone
 	if orch.isRunning && !orch.isTmuxSessionRunning() {
-		log.Printf("Warning: Tmux session is not running")
+		log.Printf("Tmux session '%s' no longer exists, shutting down orchestrator", orch.sessionName)
+		orch.cancel() // Trigger graceful shutdown
 	}
 }
 
