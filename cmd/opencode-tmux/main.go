@@ -58,6 +58,7 @@ type TmuxOrchestrator struct {
 	layoutMutex      sync.Mutex
 	paneSupervisorMu sync.Mutex
 	paneSupervisors  map[string]context.CancelFunc
+	lock             *session.SessionLock
 }
 
 // NewTmuxOrchestrator creates a new tmux orchestrator
@@ -1756,6 +1757,9 @@ func (orch *TmuxOrchestrator) waitForShutdown() {
 
 // monitorHealth monitors the health of the system
 func (orch *TmuxOrchestrator) monitorHealth() {
+	// Start tmux session watcher in background
+	go orch.watchTmuxSession()
+
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 
@@ -1765,6 +1769,29 @@ func (orch *TmuxOrchestrator) monitorHealth() {
 			return
 		case <-ticker.C:
 			orch.performHealthCheck()
+		}
+	}
+}
+
+// watchTmuxSession polls tmux has-session to detect session exit quickly
+func (orch *TmuxOrchestrator) watchTmuxSession() {
+	for {
+		select {
+		case <-orch.ctx.Done():
+			return
+		default:
+			cmd := exec.Command(orch.tmuxCommand, "has-session", "-t", orch.sessionName)
+			if err := cmd.Run(); err != nil {
+				log.Printf("Tmux session '%s' no longer exists, shutting down", orch.sessionName)
+				// Release lock immediately so new process can start
+				if orch.lock != nil {
+					orch.lock.Release()
+					orch.lock = nil
+				}
+				orch.cancel()
+				return
+			}
+			time.Sleep(1 * time.Second)
 		}
 	}
 }
@@ -2061,7 +2088,11 @@ func main() {
 		}
 		log.Fatalf("Failed to acquire lock: %v", err)
 	}
-	defer lock.Release()
+	defer func() {
+		if lock != nil {
+			lock.Release()
+		}
+	}()
 	log.Printf("Lock acquired: %s", pathMgr.PIDPath())
 
 	if envStatePath != "" {
@@ -2097,6 +2128,7 @@ func main() {
 
 	// Create orchestrator
 	orchestrator := NewTmuxOrchestrator(sessionName, socketPath, statePath, serverURL, httpClient, serverOnly, layoutCfg, reuseSessionFlag, forceNewSessionFlag, attachOnlyFlag, configPath)
+	orchestrator.lock = lock
 
 	if err := orchestrator.prepareExistingSession(); err != nil {
 		log.Fatal(err)
@@ -2182,8 +2214,20 @@ func (orch *TmuxOrchestrator) startSSEClient() error {
 					log.Printf("Event stream error: %v", err)
 				}
 				_ = stream.Close()
-				log.Printf("Event stream closed; retrying in 5 seconds...")
-				time.Sleep(5 * time.Second)
+
+				// Check if we're shutting down before retrying
+				select {
+				case <-orch.ctx.Done():
+					log.Printf("Event stream stopping due to context cancellation")
+					return
+				default:
+					log.Printf("Event stream closed; retrying in 5 seconds...")
+					select {
+					case <-orch.ctx.Done():
+						return
+					case <-time.After(5 * time.Second):
+					}
+				}
 			}
 		}
 	}()
