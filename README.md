@@ -65,7 +65,7 @@ Run the automated installation script:
 
 ```bash
 git clone https://github.com/Ubisoft-potato/TmuxCoder
-cd tmux_coder
+cd TmuxCoder
 ./install.sh
 ```
 
