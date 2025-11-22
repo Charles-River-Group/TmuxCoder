@@ -1,0 +1,66 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 500">
+  <!-- Background -->
+  <rect width="800" height="500" fill="#1e1e1e" rx="10" ry="10"/>
+  
+  <!-- Definitions for markers -->
+  <defs>
+    <marker id="arrowhead" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#cccccc"/>
+    </marker>
+  </defs>
+
+  <!-- Orchestrator Box -->
+  <g transform="translate(200, 50)">
+    <rect width="400" height="100" rx="5" ry="5" fill="#2d2d2d" stroke="#4a90e2" stroke-width="2"/>
+    <text x="20" y="30" font-family="Arial, sans-serif" font-size="16" font-weight="bold" fill="#ffffff">opencode-tmux (orchestrator)</text>
+    <text x="30" y="60" font-family="Arial, sans-serif" font-size="14" fill="#cccccc">• Spawns &amp; monitors panel processes</text>
+    <text x="30" y="85" font-family="Arial, sans-serif" font-size="14" fill="#cccccc">• IPC server (Unix socket)</text>
+  </g>
+
+  <!-- IPC Label -->
+  <text x="400" y="200" text-anchor="middle" font-family="Arial, sans-serif" font-size="12" fill="#888888">(IPC messages)</text>
+
+  <!-- Arrows from Orchestrator to Panels -->
+  <!-- Main vertical line -->
+  <line x1="400" y1="150" x2="400" y2="220" stroke="#cccccc" stroke-width="2"/>
+  <!-- Horizontal distributor line -->
+  <line x1="150" y1="220" x2="650" y2="220" stroke="#cccccc" stroke-width="2"/>
+  <!-- Vertical lines to panels -->
+  <line x1="150" y1="220" x2="150" y2="250" stroke="#cccccc" stroke-width="2" marker-end="url(#arrowhead)"/>
+  <line x1="400" y1="220" x2="400" y2="250" stroke="#cccccc" stroke-width="2" marker-end="url(#arrowhead)"/>
+  <line x1="650" y1="220" x2="650" y2="250" stroke="#cccccc" stroke-width="2" marker-end="url(#arrowhead)"/>
+
+  <!-- Panels -->
+  <!-- Sessions Panel -->
+  <g transform="translate(75, 250)">
+    <rect width="150" height="80" rx="5" ry="5" fill="#252526" stroke="#50fa7b" stroke-width="2"/>
+    <text x="75" y="35" text-anchor="middle" font-family="Arial, sans-serif" font-size="14" font-weight="bold" fill="#ffffff">sessions</text>
+    <text x="75" y="55" text-anchor="middle" font-family="Arial, sans-serif" font-size="14" font-weight="bold" fill="#ffffff">panel</text>
+  </g>
+
+  <!-- Messages Panel -->
+  <g transform="translate(325, 250)">
+    <rect width="150" height="80" rx="5" ry="5" fill="#252526" stroke="#50fa7b" stroke-width="2"/>
+    <text x="75" y="35" text-anchor="middle" font-family="Arial, sans-serif" font-size="14" font-weight="bold" fill="#ffffff">messages</text>
+    <text x="75" y="55" text-anchor="middle" font-family="Arial, sans-serif" font-size="14" font-weight="bold" fill="#ffffff">panel</text>
+  </g>
+
+  <!-- Input Panel -->
+  <g transform="translate(575, 250)">
+    <rect width="150" height="80" rx="5" ry="5" fill="#252526" stroke="#50fa7b" stroke-width="2"/>
+    <text x="75" y="35" text-anchor="middle" font-family="Arial, sans-serif" font-size="14" font-weight="bold" fill="#ffffff">input</text>
+    <text x="75" y="55" text-anchor="middle" font-family="Arial, sans-serif" font-size="14" font-weight="bold" fill="#ffffff">panel</text>
+  </g>
+
+  <!-- Shared State Connection -->
+  <line x1="400" y1="330" x2="400" y2="380" stroke="#cccccc" stroke-width="2" stroke-dasharray="5,5"/>
+  
+  <!-- Shared State File -->
+  <g transform="translate(360, 380)">
+    <path d="M10,0 L70,0 L70,60 L10,60 Z" fill="#333333" stroke="#f1fa8c" stroke-width="2"/>
+    <path d="M50,0 L50,20 L70,20" fill="none" stroke="#f1fa8c" stroke-width="2"/>
+    <text x="40" y="80" text-anchor="middle" font-family="Arial, sans-serif" font-size="12" fill="#cccccc">(shared state.json)</text>
+    <text x="40" y="35" text-anchor="middle" font-family="Arial, sans-serif" font-size="10" fill="#ffffff">JSON</text>
+  </g>
+
+</svg>

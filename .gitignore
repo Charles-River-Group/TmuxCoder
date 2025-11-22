@@ -1,3 +1,4 @@
+.idea
 .gocache
 .gomodcache
 cmd/opencode-input/dist/input-pane

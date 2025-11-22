@@ -4,27 +4,32 @@
 [![tmux](https://img.shields.io/badge/tmux-%3E%3D3.2-green.svg)](https://github.com/tmux/tmux)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-A tmux-based workspace manager that orchestrates multi-pane TUI applications with shared state and persistent sessions.
+An AI agent coding orchestrator with a tmux-based TUI interface. Provides a multi-pane terminal workspace for interacting with AI coding assistants powered by the [OpenCode](https://github.com/sst/opencode) API.
 
 ## What & Why
 
-Most terminal multiplexers handle window splitting, but managing **state synchronization** between panes, **process lifecycles**, and **hot-reloading layouts** requires custom glue code. tmux_coder solves this by providing:
+AI coding tools typically run in isolated environments, but developers need a persistent, organized workspace to:
+- Manage multiple AI coding sessions simultaneously
+- Review AI-generated code and messages with proper formatting
+- Send commands and prompts to AI agents
+- Track conversation history across sessions
 
-- A process orchestrator that supervises TUI panels and restarts them on failure
-- Shared state persistence across all panes (sessions, messages, themes)
-- IPC infrastructure for inter-pane communication
-- Hot-reloadable YAML-based layouts
+TmuxCoder solves this by providing a **tmux-based orchestrator** that integrates with the OpenCode server API to deliver:
 
-Built for developers who want a robust terminal workspace without leaving tmux.
+- **Multi-session AI coding** – Create, switch between, and manage multiple AI coding sessions
+- **Real-time streaming** – SSE-based streaming of AI responses from OpenCode API
+- **Persistent workspace** – All sessions, messages, and state persist across restarts
+- **Organized UI** – Dedicated panels for session browsing, message history, and input
+
+Built for developers who want a terminal-native AI coding assistant without leaving tmux.
 
 ## Features
 
-- **Process orchestration** – Automatically spawns, monitors, and restarts panel processes
-- **TUI panels** – Built-in Bubble Tea UIs for sessions, messages, and input (as separate binaries)
-- **Shared state** – JSON-backed persistence with event bus for cross-pane sync
-- **SSE streaming** – Real-time event ingestion from OpenCode API
-- **Hot-reload layouts** – Update YAML configs and apply changes without killing processes
-- **Helper scripts** – `start.sh` handles builds, launches, and selective panel rebuilds
+- **AI Session Management** – Create, browse, switch, and delete AI coding sessions via OpenCode API with keyboard navigation
+- **Streaming Message Display** – Real-time SSE streaming of AI responses with markdown rendering and syntax highlighting
+- **Interactive Input Panel** – Send prompts with command mode and multiline support
+- **Smart State Persistence** – Version-based optimistic locking with JSON persistence and automatic conflict resolution
+- **Manual Layout Reload** – Apply YAML config changes via `--reload-layout` flag without killing processes
 
 ## Screenshots
 
@@ -32,23 +37,7 @@ _Coming soon - add screenshots showing the three-pane layout in action_
 
 ## Architecture
 
-```
-┌─────────────────────────────────────────┐
-│  opencode-tmux (orchestrator)           │
-│  ├─ Spawns & monitors panel processes   │
-│  ├─ IPC server (Unix socket)            │
-│  └─ Hot-reload config watcher           │
-└─────────────────────────────────────────┘
-            │ (IPC messages)
-    ┌───────┴───────┬───────────────┐
-    ▼               ▼               ▼
-┌─────────┐   ┌──────────┐   ┌────────┐
-│sessions │   │ messages │   │ input  │
-│ panel   │   │  panel   │   │ panel  │
-└─────────┘   └──────────┘   └────────┘
-                    │
-            (shared state.json)
-```
+![Architecture Diagram](docs/architecture.svg)
 
 **Key Components:**
 
