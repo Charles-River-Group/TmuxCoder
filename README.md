@@ -85,17 +85,9 @@ tmuxcoder           # If installed to system/user bin
 # OR
 ./tmuxcoder         # Run from project directory
 ```
-```
 
 > **Note:** This project includes [opencode](https://github.com/sst/opencode) as a git submodule in `packages/opencode/`. The submodule provides the OpenCode server and SDK.
-## Quick Start
-**After installation, simply run:**
 
-```bash
-tmuxcoder           # If installed to PATH
-# OR
-./tmuxcoder         # From project directory
-```
 
 This will:
 1. Check and install OpenCode dependencies (with progress display)
@@ -171,20 +163,6 @@ tmuxcoder --server http://localhost:8080
 
 # Pass additional arguments to opencode-tmux
 tmuxcoder -- --reload-layout
-```
-
-## Usage
-
-**Start script options:**
-
-```bash
-./scripts/start.sh [options]
-
-
---attach-only                 # Attach to existing session
---reload-layout               # Hot-reload layout without restart
---server <URL>                # Override OPENCODE_SERVER
---skip-build                  # Skip compilation step
 ```
 
 **Direct binary flags:**
