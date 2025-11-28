@@ -28,6 +28,7 @@ import (
 	"github.com/opencode/tmux_coder/internal/paths"
 	"github.com/opencode/tmux_coder/internal/persistence"
 	"github.com/opencode/tmux_coder/internal/session"
+	"github.com/opencode/tmux_coder/internal/socket"
 	"github.com/opencode/tmux_coder/internal/state"
 	"github.com/opencode/tmux_coder/internal/theme"
 	"github.com/opencode/tmux_coder/internal/types"
@@ -111,6 +112,11 @@ func (orch *TmuxOrchestrator) Initialize() error {
 	if err := orch.loadSessionsFromServer(); err != nil {
 		log.Printf("Warning: Failed to load sessions from server: %v", err)
 		// Don't fail initialization if session loading fails - it's not critical
+	}
+
+	// Stage 2: Ensure socket is clean before starting IPC server
+	if err := orch.ensureSocketClean(); err != nil {
+		return fmt.Errorf("failed to prepare socket: %w", err)
 	}
 
 	// Start IPC server
@@ -206,34 +212,199 @@ func (orch *TmuxOrchestrator) Stop() error {
 	// Cancel context to signal shutdown
 	orch.cancel()
 
+	// ===== PHASE 1: Stop accepting new connections =====
+	if orch.ipcServer != nil {
+		log.Printf("[Shutdown] Stopping IPC server...")
+		orch.ipcServer.Stop()
+	}
+
+	// ===== PHASE 2: Wait for existing IPC connections to close =====
+	if orch.ipcServer != nil {
+		log.Printf("[Shutdown] Waiting for IPC connections to close...")
+		orch.waitForIPCConnectionsClose(5 * time.Second)
+	}
+
+	// ===== PHASE 3: Stop supervisors =====
+	log.Printf("[Shutdown] Stopping panel supervisors...")
 	orch.paneSupervisorMu.Lock()
-	for _, cancel := range orch.paneSupervisors {
+	for paneTarget, cancel := range orch.paneSupervisors {
+		log.Printf("[Shutdown] Stopping supervisor for pane %s", paneTarget)
 		cancel()
 	}
 	orch.paneSupervisors = map[string]context.CancelFunc{}
 	orch.paneSupervisorMu.Unlock()
 
-	// Stop sync manager
+	// ===== PHASE 4: Stop other components =====
 	if orch.syncManager != nil {
+		log.Printf("[Shutdown] Stopping sync manager...")
 		orch.syncManager.Stop()
 	}
 
-	// Stop IPC server
-	if orch.ipcServer != nil {
-		orch.ipcServer.Stop()
-	}
-
-	// Kill tmux session
+	// ===== PHASE 5: Handle tmux session =====
+	// NOTE: In Stage 2, we always kill the session (backward compatible)
+	// In later stages, this will check a cleanup flag
+	log.Printf("[Shutdown] Cleaning up tmux session...")
 	if err := orch.killTmuxSession(); err != nil {
-		log.Printf("Failed to kill tmux session: %v", err)
+		log.Printf("[Shutdown] WARNING: Failed to kill tmux session: %v", err)
 	}
 
-	// Cleanup socket file
-	if err := os.Remove(orch.socketPath); err != nil && !os.IsNotExist(err) {
-		log.Printf("Failed to remove socket file: %v", err)
+	// ===== PHASE 6: Cleanup socket file (enhanced) =====
+	log.Printf("[Shutdown] Cleaning up socket file...")
+	if err := orch.cleanupSocket(); err != nil {
+		log.Printf("[Shutdown] WARNING: Failed to cleanup socket: %v", err)
+		// Don't return error - continue with shutdown
 	}
 
-	log.Printf("Tmux orchestrator stopped")
+	// ===== PHASE 7: Release lock (if exists) =====
+	if orch.lock != nil {
+		log.Printf("[Shutdown] Releasing session lock...")
+		orch.lock.Release()
+		orch.lock = nil
+	}
+
+	log.Printf("Tmux orchestrator stopped successfully")
+	return nil
+}
+
+// ensureSocketClean ensures the socket file is in a usable state before starting the IPC server.
+// It checks if the socket already exists and attempts to clean it up if it's stale.
+//
+// Returns:
+//   - nil: Socket is clean and ready to use
+//   - error: Socket conflict or permission issue
+func (orch *TmuxOrchestrator) ensureSocketClean() error {
+	status, err := socket.CheckSocketStatus(orch.socketPath)
+
+	switch status {
+	case socket.SocketNonExistent:
+		// Ideal case - socket doesn't exist, can create directly
+		log.Printf("[Socket] Path is clean: %s", orch.socketPath)
+		return nil
+
+	case socket.SocketStale:
+		// Stale socket found - cleanup and continue
+		log.Printf("[Socket] Found stale socket, cleaning up: %s", orch.socketPath)
+		if err := socket.CleanupStaleSocket(orch.socketPath); err != nil {
+			return fmt.Errorf("failed to cleanup stale socket: %w", err)
+		}
+		log.Printf("[Socket] Stale socket cleaned successfully")
+		return nil
+
+	case socket.SocketActive:
+		// Another process is using this socket
+		if orch.forceNewSession {
+			// Force mode - warn but allow continuation
+			log.Printf("[Socket] WARNING: Forcing cleanup of active socket: %s", orch.socketPath)
+			log.Printf("[Socket] This may disconnect an existing orchestrator!")
+
+			// Try to cleanup anyway
+			if err := os.Remove(orch.socketPath); err != nil && !os.IsNotExist(err) {
+				return fmt.Errorf("failed to force remove active socket: %w", err)
+			}
+			return nil
+		}
+
+		// Normal mode - prevent starting
+		return fmt.Errorf(
+			"another orchestrator is already running with socket %s\n"+
+				"  → To attach to existing session: tmuxcoder attach %s\n"+
+				"  → To stop existing daemon:       tmuxcoder stop %s\n"+
+				"  → To force new session:          tmuxcoder start %s --force-new",
+			orch.socketPath, orch.sessionName, orch.sessionName, orch.sessionName,
+		)
+
+	case socket.SocketPermissionDenied:
+		return fmt.Errorf(
+			"permission denied to access socket %s: %w\n"+
+				"  → Socket may be owned by another user\n"+
+				"  → Check file permissions: ls -l %s",
+			orch.socketPath, err, orch.socketPath,
+		)
+
+	default:
+		if err != nil {
+			return fmt.Errorf("unknown socket status error: %w", err)
+		}
+		return fmt.Errorf("unknown socket status: %v", status)
+	}
+}
+
+// waitForIPCConnectionsClose waits for all IPC connections to close gracefully.
+// This is called during shutdown to ensure all panel connections are properly closed
+// before cleaning up the socket file.
+//
+// Parameters:
+//   - timeout: Maximum time to wait for connections to close
+//
+// Behavior:
+//   - Returns immediately if no connections
+//   - Polls connection count every 100ms
+//   - Logs warnings if connections remain after timeout
+func (orch *TmuxOrchestrator) waitForIPCConnectionsClose(timeout time.Duration) {
+	if orch.ipcServer == nil {
+		return
+	}
+
+	deadline := time.Now().Add(timeout)
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
+	for time.Now().Before(deadline) {
+		count := orch.ipcServer.ConnectionCount()
+		if count == 0 {
+			log.Printf("[IPC] All connections closed gracefully")
+			return
+		}
+
+		select {
+		case <-ticker.C:
+			log.Printf("[IPC] Waiting for %d connection(s) to close...", count)
+		case <-time.After(timeout):
+			count := orch.ipcServer.ConnectionCount()
+			log.Printf("[IPC] Timeout waiting for connections, %d still active", count)
+			return
+		}
+	}
+
+	count := orch.ipcServer.ConnectionCount()
+	if count > 0 {
+		log.Printf("[IPC] WARNING: %d connection(s) still active after timeout", count)
+	}
+}
+
+// cleanupSocket performs safe socket file cleanup on shutdown.
+// It checks the socket status before attempting removal and provides detailed logging.
+//
+// Returns:
+//   - nil: Socket cleaned successfully or already removed
+//   - error: Failed to remove socket (logged but not critical)
+func (orch *TmuxOrchestrator) cleanupSocket() error {
+	if orch.socketPath == "" {
+		return nil
+	}
+
+	log.Printf("[Socket] Cleaning up socket: %s", orch.socketPath)
+
+	// Check socket status before cleanup (for logging purposes)
+	status, err := socket.CheckSocketStatus(orch.socketPath)
+	if err != nil && status != socket.SocketStale && status != socket.SocketNonExistent {
+		log.Printf("[Socket] WARNING: Failed to check socket status: %v", err)
+		// Continue trying to delete anyway
+	}
+
+	// Log the status for debugging
+	log.Printf("[Socket] Status before cleanup: %s", status.String())
+
+	// Delete socket file
+	if err := os.Remove(orch.socketPath); err != nil {
+		if os.IsNotExist(err) {
+			log.Printf("[Socket] Socket file already removed: %s", orch.socketPath)
+			return nil
+		}
+		return fmt.Errorf("failed to remove socket file: %w", err)
+	}
+
+	log.Printf("[Socket] Socket file removed successfully: %s", orch.socketPath)
 	return nil
 }
 

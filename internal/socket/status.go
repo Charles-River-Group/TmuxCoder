@@ -53,7 +53,8 @@ func CheckSocketStatus(socketPath string) (SocketStatus, error) {
 
 	// 2. Check if it's a socket file
 	if info.Mode()&os.ModeSocket == 0 {
-		return SocketNonExistent, fmt.Errorf("%s is not a socket file", socketPath)
+		// File exists but is not a socket - treat as stale (leftover from crash/improper cleanup)
+		return SocketStale, fmt.Errorf("%s exists but is not a socket file (treating as stale)", socketPath)
 	}
 
 	// 3. Try connecting to check if a process is listening

@@ -583,3 +583,11 @@ func (server *SocketServer) IsRunning() bool {
 	defer server.runningMux.RUnlock()
 	return server.isRunning
 }
+
+// ConnectionCount returns the number of active IPC connections
+// This method is thread-safe and can be called concurrently
+func (server *SocketServer) ConnectionCount() int {
+	server.connectionsMux.RLock()
+	defer server.connectionsMux.RUnlock()
+	return len(server.connections)
+}
