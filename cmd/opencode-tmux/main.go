@@ -2730,6 +2730,9 @@ func runLegacyMode() {
 
 // main is the entry point that dispatches to subcommands or legacy mode
 func main() {
+	// Setup bridge function for start command to call legacy mode
+	commands.RunLegacyWithArgs = runLegacyModeWithArgs
+
 	// Check if subcommand is used
 	if len(os.Args) >= 2 {
 		subcommand := os.Args[1]
@@ -2763,8 +2766,8 @@ func executeSubcommand(subcommand string, args []string) {
 
 	switch subcommand {
 	case "start":
-		runLegacyModeWithArgs(translateStartArgs(args))
-		return
+		// Use new CmdStart implementation
+		err = commands.CmdStart(args)
 
 	case "attach":
 		err = commands.CmdAttach(args)
@@ -2841,7 +2844,7 @@ func translateStartArgs(args []string) []string {
 
 // runLegacyModeWithArgs re-runs the legacy starter after re-writing os.Args
 // so that the "start" subcommand token is transparent to the legacy parser.
-func runLegacyModeWithArgs(args []string) {
+func runLegacyModeWithArgs(args []string) error {
 	originalArgs := os.Args
 	newArgs := append([]string{os.Args[0]}, args...)
 	os.Args = newArgs
@@ -2849,7 +2852,10 @@ func runLegacyModeWithArgs(args []string) {
 		os.Args = originalArgs
 	}()
 
+	// runLegacyMode calls log.Fatal on errors, so we never actually return an error
+	// This is kept for interface compatibility
 	runLegacyMode()
+	return nil
 }
 
 // printHelp shows usage information
