@@ -24,9 +24,11 @@ import (
 	"github.com/opencode/tmux_coder/cmd/opencode-tmux/commands"
 	"github.com/opencode/tmux_coder/internal/client"
 	tmuxconfig "github.com/opencode/tmux_coder/internal/config"
+	"github.com/opencode/tmux_coder/internal/interfaces"
 	"github.com/opencode/tmux_coder/internal/ipc"
 	panelregistry "github.com/opencode/tmux_coder/internal/panel"
 	"github.com/opencode/tmux_coder/internal/paths"
+	"github.com/opencode/tmux_coder/internal/permission"
 	"github.com/opencode/tmux_coder/internal/persistence"
 	"github.com/opencode/tmux_coder/internal/session"
 	"github.com/opencode/tmux_coder/internal/socket"
@@ -96,11 +98,32 @@ type TmuxOrchestrator struct {
 
 	// Stage 4: Shutdown control
 	cleanupOnExit bool // Whether to destroy tmux session on shutdown
+
+	// Stage 5: Status tracking
+	startedAt time.Time // When the orchestrator was started
+	owner     interfaces.SessionOwner // Session owner information
 }
 
 // NewTmuxOrchestrator creates a new tmux orchestrator
 func NewTmuxOrchestrator(sessionName, socketPath, statePath, serverURL string, httpClient *opencode.Client, serverOnly bool, layout *tmuxconfig.Layout, reuseExisting bool, forceNew bool, attachOnly bool, configPath string, runMode RunMode) *TmuxOrchestrator {
 	ctx, cancel := context.WithCancel(context.Background())
+
+	// Get current user information for session owner
+	currentUser, err := ipc.GetCurrentUser()
+	var owner interfaces.SessionOwner
+	if err != nil {
+		log.Printf("Warning: failed to get current user: %v", err)
+		// Use fallback values
+		owner = interfaces.SessionOwner{
+			UID:       uint32(os.Getuid()),
+			GID:       uint32(os.Getgid()),
+			Username:  "unknown",
+			Hostname:  "unknown",
+			StartedAt: time.Now(),
+		}
+	} else {
+		owner = ipc.ToSessionOwner(currentUser)
+	}
 
 	return &TmuxOrchestrator{
 		sessionName:     sessionName,
@@ -122,6 +145,8 @@ func NewTmuxOrchestrator(sessionName, socketPath, statePath, serverURL string, h
 		attachOnly:      attachOnly,
 		configPath:      configPath,
 		runMode:         runMode, // Stage 3: Signal handling mode
+		startedAt:       time.Now(),
+		owner:           owner,
 	}
 }
 
@@ -689,6 +714,12 @@ func (orch *TmuxOrchestrator) startIPCServer() error {
 		orch.syncManager,
 		orch,
 	)
+
+	// Stage 5: Set up permission checker with default policy
+	permissionChecker := permission.NewChecker(orch.owner, nil)
+	orch.ipcServer.SetPermissionChecker(permissionChecker)
+	log.Printf("Permission checker configured for session owner: %s (UID=%d, GID=%d)",
+		orch.owner.Username, orch.owner.UID, orch.owner.GID)
 
 	// Start server
 	if err := orch.ipcServer.Start(); err != nil {
@@ -2005,6 +2036,118 @@ func (orch *TmuxOrchestrator) Shutdown(cleanup bool) error {
 	orch.cancel()
 
 	return nil
+}
+
+// GetStatus returns the current status of the session
+func (orch *TmuxOrchestrator) GetStatus() (*interfaces.SessionStatus, error) {
+	// Calculate uptime
+	uptime := time.Since(orch.startedAt)
+
+	// Get panel status
+	var panels []interfaces.PanelStatus
+	orch.layoutMutex.Lock()
+	if orch.layout != nil {
+		for _, panel := range orch.layout.Panels {
+			paneID := orch.panes[panel.ID]
+			panelStatus := interfaces.PanelStatus{
+				Name:      panel.ID,
+				PaneID:    paneID,
+				IsRunning: paneID != "",
+			}
+			panels = append(panels, panelStatus)
+		}
+	}
+	orch.layoutMutex.Unlock()
+
+	// Get client count using clientTracker if available
+	clientCount := 0
+	if orch.clientTracker != nil {
+		count, _ := orch.clientTracker.GetConnectedClients()
+		clientCount = count
+	} else {
+		// Fallback: try to count clients via tmux
+		clients, err := orch.listTmuxClients()
+		if err == nil {
+			clientCount = len(clients)
+		}
+	}
+
+	status := &interfaces.SessionStatus{
+		SessionName: orch.sessionName,
+		DaemonPID:   os.Getpid(),
+		IsRunning:   orch.isRunning,
+		Uptime:      uptime,
+		StartedAt:   orch.startedAt,
+		ClientCount: clientCount,
+		Panels:      panels,
+		SocketPath:  orch.socketPath,
+		ConfigPath:  orch.configPath,
+		Owner:       orch.owner,
+	}
+
+	return status, nil
+}
+
+// GetConnectedClients returns a list of connected tmux clients
+func (orch *TmuxOrchestrator) GetConnectedClients() ([]interfaces.ClientInfo, error) {
+	// Always use direct tmux query for now
+	// ClientTracker's GetConnectedClientsInfo has different format
+	return orch.listTmuxClients()
+}
+
+// Ping checks if the daemon is responsive
+func (orch *TmuxOrchestrator) Ping() error {
+	// Simple health check - if we can respond, we're alive
+	if !orch.isRunning {
+		return fmt.Errorf("orchestrator is not running")
+	}
+	return nil
+}
+
+// listTmuxClients queries tmux for connected clients
+func (orch *TmuxOrchestrator) listTmuxClients() ([]interfaces.ClientInfo, error) {
+	// Use tmux list-clients to get client information
+	// Format: tty,pid,created,session,width,height
+	cmd := exec.Command(orch.tmuxCommand, "list-clients", "-t", orch.sessionName,
+		"-F", "#{client_tty},#{client_pid},#{client_created},#{client_session},#{client_width},#{client_height}")
+
+	output, err := cmd.Output()
+	if err != nil {
+		// Session might not exist or no clients connected
+		return []interfaces.ClientInfo{}, nil
+	}
+
+	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
+	clients := make([]interfaces.ClientInfo, 0, len(lines))
+
+	for _, line := range lines {
+		if line == "" {
+			continue
+		}
+
+		parts := strings.Split(line, ",")
+		if len(parts) != 6 {
+			continue
+		}
+
+		pid, _ := strconv.Atoi(parts[1])
+		created, _ := strconv.ParseInt(parts[2], 10, 64)
+		width, _ := strconv.Atoi(parts[4])
+		height, _ := strconv.Atoi(parts[5])
+
+		client := interfaces.ClientInfo{
+			TTY:         parts[0],
+			PID:         pid,
+			ConnectedAt: time.Unix(created, 0),
+			SessionName: parts[3],
+			Width:       width,
+			Height:      height,
+		}
+
+		clients = append(clients, client)
+	}
+
+	return clients, nil
 }
 
 // sendReloadLayoutCommand connects to the running orchestrator and requests a layout reload.

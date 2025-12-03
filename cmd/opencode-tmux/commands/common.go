@@ -153,18 +153,29 @@ func getConnectedClients(sessionName string) ([]ClientInfo, error) {
 
 // ensureOpenCodeDir creates opencode-tmux directory if not exists
 func ensureOpenCodeDir() error {
-	openCodeDir := filepath.Join(os.TempDir(), "opencode-tmux")
+	openCodeDir, err := getOpenCodeDir()
+	if err != nil {
+		return err
+	}
 	return os.MkdirAll(openCodeDir, 0755)
 }
 
 // getOpenCodeDir returns opencode-tmux directory path
 func getOpenCodeDir() (string, error) {
-	return filepath.Join(os.TempDir(), "opencode-tmux"), nil
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		// Fallback to temp dir if home dir is not available
+		homeDir = os.TempDir()
+	}
+	return filepath.Join(homeDir, ".opencode"), nil
 }
 
-// findAllSessions scans /tmp/opencode-tmux for all sessions
+// findAllSessions scans ~/.opencode for all sessions
 func findAllSessions() ([]string, error) {
-	baseDir := filepath.Join(os.TempDir(), "opencode-tmux")
+	baseDir, err := getOpenCodeDir()
+	if err != nil {
+		return nil, err
+	}
 
 	// Check sockets directory for active sessions
 	socketsDir := filepath.Join(baseDir, "sockets")
