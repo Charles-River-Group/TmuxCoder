@@ -2013,16 +2013,20 @@ func (orch *TmuxOrchestrator) ReloadLayout() error {
 
 // killTmuxSession kills the tmux session if it exists
 func (orch *TmuxOrchestrator) killTmuxSession() error {
+	log.Printf("[Shutdown] Attempting to kill tmux session '%s'...", orch.sessionName)
 	cmd := exec.Command(orch.tmuxCommand, "kill-session", "-t", orch.sessionName)
 	if err := cmd.Run(); err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok {
 			// tmux returns exit status 1 when the session does not exist; treat as success.
 			if exitErr.ExitCode() == 1 {
+				log.Printf("[Shutdown] Tmux session '%s' already doesn't exist (exit code 1)", orch.sessionName)
 				return nil
 			}
 		}
+		log.Printf("[Shutdown] Failed to kill tmux session: %v", err)
 		return err
 	}
+	log.Printf("[Shutdown] Successfully killed tmux session '%s'", orch.sessionName)
 	return nil
 }
 

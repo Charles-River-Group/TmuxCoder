@@ -106,7 +106,9 @@ COMMANDS:
     <session-name>         Start or attach to named session
     new <name>             Create new session (alias: start)
     attach <name>          Attach to existing session (alias: a)
-    stop <name>            Stop session daemon (alias: kill)
+    stop <name> [--cleanup|-c]
+                           Stop session daemon (alias: kill)
+                           --cleanup: Also kill tmux session
     list                   List all sessions (alias: ls)
     status [name]          Show session status (alias: st)
     help                   Show this help
@@ -125,8 +127,11 @@ EXAMPLES:
     # List all sessions
     tmuxcoder list
 
-    # Stop a session
+    # Stop daemon only (tmux session remains)
     tmuxcoder stop myproject
+
+    # Stop daemon and destroy tmux session
+    tmuxcoder stop myproject --cleanup
 
     # Show status
     tmuxcoder status
@@ -143,12 +148,6 @@ ENVIRONMENT VARIABLES:
     OPENCODE_SERVER           OpenCode API server URL
     OPENCODE_TMUX_CONFIG      Config file (default: ~/.opencode/tmux.yaml)
 
-NOTES:
-    - This is the Phase 2 enhanced wrapper for opencode-tmux
-    - Implements true one-command workflow with auto-attach
-    - Legacy opencode-tmux commands still available via pass-through
-
-For more information: https://github.com/yourusername/TmuxCoder
 `
 	fmt.Print(help)
 }

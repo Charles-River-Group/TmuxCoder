@@ -40,9 +40,18 @@ func NewApp() *App {
 		os.Exit(1)
 	}
 
+	binPath := filepath.Join(projectRoot, "cmd", "opencode-tmux", "dist", "opencode-tmux")
+
+	// Check if the opencode-tmux binary exists
+	if _, err := os.Stat(binPath); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: opencode-tmux binary not found at: %s\n", binPath)
+		fmt.Fprintf(os.Stderr, "Please run 'make build' to compile the binaries\n")
+		os.Exit(1)
+	}
+
 	return &App{
 		projectRoot: projectRoot,
-		binPath:     filepath.Join(projectRoot, "dist", "opencode-tmux"),
+		binPath:     binPath,
 	}
 }
 
@@ -97,6 +106,7 @@ func (a *App) ListSessions() error {
 		return err
 	}
 	cmd := exec.Command(a.binPath, "list")
+	cmd.Env = os.Environ()
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -126,15 +136,32 @@ func (a *App) AttachSession(args []string) error {
 // StopSession stops a session daemon
 func (a *App) StopSession(args []string) error {
 	sessionName := "opencode"
-	if len(args) > 0 {
-		sessionName = args[0]
+	cleanup := false
+
+	// Parse arguments
+	for i, arg := range args {
+		if arg == "--cleanup" || arg == "-c" {
+			cleanup = true
+		} else if !strings.HasPrefix(arg, "-") && i == 0 {
+			// First non-flag argument is session name
+			sessionName = arg
+		}
 	}
 
 	if err := a.ensureServer(); err != nil {
 		return err
 	}
 
-	cmd := exec.Command(a.binPath, "stop", sessionName)
+	// Build command args
+	// Note: opencode-tmux expects: stop --cleanup <session-name>
+	cmdArgs := []string{"stop"}
+	if cleanup {
+		cmdArgs = append(cmdArgs, "--cleanup")
+	}
+	cmdArgs = append(cmdArgs, sessionName)
+
+	cmd := exec.Command(a.binPath, cmdArgs...)
+	cmd.Env = os.Environ()
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -143,21 +170,20 @@ func (a *App) StopSession(args []string) error {
 
 // ShowStatus shows status of all sessions or a specific session
 func (a *App) ShowStatus(args []string) error {
+	// If no session name provided, list all sessions instead
+	if len(args) == 0 || (len(args) > 0 && strings.HasPrefix(args[0], "-")) {
+		fmt.Println("Available sessions:")
+		fmt.Println("")
+		return a.ListSessions()
+	}
+
 	if err := a.ensureServer(); err != nil {
 		return err
 	}
-	cmdArgs := []string{"status"}
-	cmdArgs = append(cmdArgs, args...)
 
-	if !containsPositionalArg(args) {
-		if session := a.currentTmuxSession(); session != "" {
-			cmdArgs = append(cmdArgs, session)
-		} else if fallback := a.selectSessionName(); fallback != "" {
-			cmdArgs = append(cmdArgs, fallback)
-		}
-	}
-
-	cmd := exec.Command(a.binPath, cmdArgs...)
+	sessionName := args[0]
+	cmd := exec.Command(a.binPath, "status", sessionName)
+	cmd.Env = os.Environ()
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -170,6 +196,7 @@ func (a *App) PassThrough(args []string) error {
 		return err
 	}
 	cmd := exec.Command(a.binPath, args...)
+	cmd.Env = os.Environ()
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -246,6 +273,7 @@ func (a *App) isSessionRunning(sessionName string) bool {
 
 	// Check if daemon is running (via status command)
 	cmd = exec.Command(a.binPath, "status", "--json", sessionName)
+	cmd.Env = os.Environ()
 	output, err := cmd.Output()
 	if err != nil {
 		return false
@@ -271,6 +299,7 @@ func (a *App) startDaemonBackground(sessionName string) error {
 	// Use opencode-tmux start with --daemon flag
 	// The daemon will detach automatically
 	cmd := exec.Command(a.binPath, "start", sessionName, "--daemon")
+	cmd.Env = os.Environ() // Inherit environment variables including OPENCODE_SERVER
 
 	// Start the process
 	if err := cmd.Run(); err != nil {
@@ -497,11 +526,19 @@ func findProjectRoot() string {
 	return ""
 }
 
-// isProjectRoot checks if directory contains opencode-tmux binary
+// isProjectRoot checks if directory is the TmuxCoder project root
 func isProjectRoot(dir string) bool {
-	binPath := filepath.Join(dir, "dist", "opencode-tmux")
-	_, err := os.Stat(binPath)
-	return err == nil
+	// Check for project structure markers (more reliable than checking build artifacts)
+	// Look for the cmd/tmuxcoder directory
+	cmdDir := filepath.Join(dir, "cmd", "tmuxcoder")
+	if info, err := os.Stat(cmdDir); err == nil && info.IsDir() {
+		// Also verify opencode-tmux command exists
+		opencodeCmd := filepath.Join(dir, "cmd", "opencode-tmux")
+		if info2, err2 := os.Stat(opencodeCmd); err2 == nil && info2.IsDir() {
+			return true
+		}
+	}
+	return false
 }
 
 // searchUpward searches upward for project root
