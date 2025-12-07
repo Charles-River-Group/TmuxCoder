@@ -76,7 +76,11 @@ Use `tmuxcoder --server http://host:port` to point at an existing OpenCode deplo
 
 ### 5. Customize Layout & Config
 
-- `tmuxcoder layout <session> path/to/layout.yaml` reloads the layout for a **running** session without attaching (fails fast if that session/daemon isn’t up yet).
+- `tmuxcoder layout <session> path/to/layout.yaml` reloads the layout for a **running** session without attaching (fails fast if that session/daemon isn’t up yet). Example:
+
+  ```bash
+  tmuxcoder layout my-session ~/.opencode/tests/test-tmux.yaml
+  ```
 
 - Environment variables:
 
@@ -104,5 +108,4 @@ Common symptoms:
 - **State not saving** – verify disk permissions and free space
 
 If everything looks stuck, run `tmuxcoder stop <name> --cleanup`, then `tmuxcoder` again for a clean slate.
-
 
