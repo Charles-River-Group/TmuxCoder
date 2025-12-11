@@ -1,0 +1,9 @@
+{
+  "mode": "local",
+  "cache": {
+    "enabled": true,
+    "ttl": 300,
+    "maxSize": 100
+  },
+  "debug": false
+}

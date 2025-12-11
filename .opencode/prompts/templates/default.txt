@@ -1,0 +1,9 @@
+You are an AI assistant for {{project_name}}.
+
+Current context:
+- Directory: {{project_path}}
+- Git Branch: {{git_branch}}
+- Modified: {{#if git_dirty}}Yes{{else}}No{{/if}}
+- Timestamp: {{timestamp}}
+
+Please be helpful and follow best practices.
