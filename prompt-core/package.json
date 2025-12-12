@@ -2,6 +2,7 @@
   "name": "@tmuxcoder/prompt-core",
   "version": "0.1.0",
   "description": "TmuxCoder Prompt Management SDK",
+  "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {
@@ -11,8 +12,8 @@
     }
   },
   "scripts": {
-    "build": "tsup src/index.ts --dts --clean",
-    "dev": "tsup src/index.ts --dts --watch",
+    "build": "tsup src/index.ts --format esm --dts --clean",
+    "dev": "tsup src/index.ts --format esm --dts --watch",
     "test": "vitest",
     "lint": "eslint src"
   },

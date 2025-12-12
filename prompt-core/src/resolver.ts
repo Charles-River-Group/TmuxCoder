@@ -1,5 +1,4 @@
 import type { PromptContext, ResolvedPrompt, PromptConfig } from "./types"
-import { LocalResolver } from "./local/manager"
 
 /**
  * Prompt Resolver abstract interface
@@ -34,10 +33,13 @@ export abstract class PromptResolver {
  * Resolver Factory
  */
 export class ResolverFactory {
-  static create(config: PromptConfig): PromptResolver {
+  static async create(config: PromptConfig): Promise<PromptResolver> {
     switch (config.mode) {
-      case "local":
+      case "local": {
+        // Lazy import to avoid circular dependency
+        const { LocalResolver } = await import("./local/manager.js")
         return new LocalResolver(config)
+      }
 
       case "remote":
         throw new Error("Remote mode not implemented yet")

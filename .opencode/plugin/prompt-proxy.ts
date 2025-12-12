@@ -1,6 +1,6 @@
 import type { Plugin } from "@opencode-ai/plugin"
-import { TmuxCoderPrompts } from "@tmuxcoder/prompt-core"
-import type { PromptConfig, PromptContext } from "@tmuxcoder/prompt-core"
+import { TmuxCoderPrompts } from "../../prompt-core/src/index.ts"
+import type { PromptConfig, PromptContext } from "../../prompt-core/src/index.ts"
 import { join } from "path"
 import { existsSync } from "fs"
 

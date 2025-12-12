@@ -1,8 +1,14 @@
+// Export types first
 export * from "./types"
-export * from "./resolver"
+
+// Export base classes
 export * from "./cache"
+export * from "./resolver"
+
+// Export implementations (after base classes)
 export { LocalResolver } from "./local/manager"
 
+// Import for main SDK class
 import { ResolverFactory } from "./resolver"
 import { PromptCache } from "./cache"
 import type { PromptConfig, PromptContext, ResolvedPrompt } from "./types"
@@ -11,18 +17,19 @@ import type { PromptConfig, PromptContext, ResolvedPrompt } from "./types"
  * TmuxCoder Prompt SDK main entry point
  */
 export class TmuxCoderPrompts {
-  private resolver: ReturnType<typeof ResolverFactory.create>
+  private resolver?: Awaited<ReturnType<typeof ResolverFactory.create>>
   private cache: PromptCache
   private initialized = false
 
   constructor(private config: PromptConfig) {
-    this.resolver = ResolverFactory.create(config)
     this.cache = new PromptCache(config.cache || { enabled: false })
   }
 
   async initialize(): Promise<void> {
     if (this.initialized) return
 
+    // Create resolver (lazy loaded to avoid circular dependency)
+    this.resolver = await ResolverFactory.create(this.config)
     await this.resolver.initialize()
     this.initialized = true
 
@@ -35,7 +42,7 @@ export class TmuxCoderPrompts {
   }
 
   async resolve(context: PromptContext): Promise<ResolvedPrompt> {
-    if (!this.initialized) {
+    if (!this.initialized || !this.resolver) {
       throw new Error("SDK not initialized. Call initialize() first.")
     }
 
@@ -64,11 +71,14 @@ export class TmuxCoderPrompts {
   }
 
   async healthCheck(): Promise<boolean> {
+    if (!this.resolver) return false
     return this.resolver.healthCheck()
   }
 
   async dispose(): Promise<void> {
-    await this.resolver.dispose()
+    if (this.resolver) {
+      await this.resolver.dispose()
+    }
     this.cache.dispose()
     this.initialized = false
   }
