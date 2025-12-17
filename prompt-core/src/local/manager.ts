@@ -3,6 +3,7 @@ import type { PromptContext, ResolvedPrompt, PromptConfig } from "../types"
 import { TemplateEngine } from "./template"
 import { ExperimentManager } from "./experiments"
 import { ParameterManager } from "./parameters"
+import { promptLogger } from "../logger"
 
 export class LocalResolver extends PromptResolver {
   private templateEngine!: TemplateEngine
@@ -57,7 +58,7 @@ export class LocalResolver extends PromptResolver {
     this.initialized = true
 
     if (this.config.debug) {
-      console.log("[LocalResolver] Initialized successfully")
+      promptLogger.debug("[LocalResolver] Initialized successfully")
     }
   }
 
@@ -110,17 +111,18 @@ export class LocalResolver extends PromptResolver {
 
       if (this.config.debug) {
         const elapsed = Date.now() - startTime
-        console.log(`[LocalResolver] Resolved in ${elapsed}ms`, {
+        promptLogger.debug("[LocalResolver] Resolved prompt", {
           agent: context.agent,
           variantID,
           temperature: parameters.temperature,
+          durationMs: elapsed,
         })
       }
 
       return resolved
 
     } catch (error) {
-      console.error("[LocalResolver] Failed to resolve prompt:", error)
+      promptLogger.error("[LocalResolver] Failed to resolve prompt", error)
 
       // Return safe default
       return this.getFallbackPrompt(context)

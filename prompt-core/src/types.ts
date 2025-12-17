@@ -86,6 +86,10 @@ export interface PromptConfig {
     maxSize?: number                // entries
   }
 
+  logging?: {
+    filePath?: string
+  }
+
   // Debug mode
   debug?: boolean
 }

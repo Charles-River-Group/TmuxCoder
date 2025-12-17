@@ -1,6 +1,7 @@
 import { readFile } from "fs/promises"
 import { existsSync } from "fs"
 import type { Experiment } from "./experiments"
+import { promptLogger } from "../logger"
 
 export interface ParametersConfig {
   defaults?: {
@@ -44,10 +45,10 @@ export class ParameterManager {
       this.config = JSON.parse(content)
 
       if (this.opts.debug) {
-        console.log("[ParameterManager] Loaded parameters config")
+        promptLogger.debug("[ParameterManager] Loaded parameters config")
       }
     } catch (error) {
-      console.error("[ParameterManager] Failed to load parameters:", error)
+      promptLogger.error("[ParameterManager] Failed to load parameters", error)
       this.config = { defaults: { temperature: 0.7, topP: 0.9 } }
     }
   }

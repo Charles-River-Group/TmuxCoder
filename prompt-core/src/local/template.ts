@@ -1,6 +1,7 @@
 import { readFile } from "fs/promises"
 import { join } from "path"
 import Handlebars from "handlebars"
+import { promptLogger } from "../logger"
 
 export interface TemplateEngineConfig {
   templatesDir: string
@@ -24,10 +25,10 @@ export class TemplateEngine {
       })
 
       if (this.config.debug) {
-        console.log("[TemplateEngine] Loaded default template")
+        promptLogger.debug("[TemplateEngine] Loaded default template")
       }
     } catch (error) {
-      console.warn("[TemplateEngine] No default template found, using hardcoded fallback")
+      promptLogger.warn("[TemplateEngine] No default template found, using hardcoded fallback", error)
       this.defaultTemplate = Handlebars.compile("You are an AI assistant.")
     }
 
@@ -41,7 +42,7 @@ export class TemplateEngine {
     try {
       return template(context)
     } catch (error) {
-      console.error(`[TemplateEngine] Failed to render template '${templateID}':`, error)
+      promptLogger.error(`[TemplateEngine] Failed to render template '${templateID}'`, error)
       throw error
     }
   }
@@ -66,13 +67,13 @@ export class TemplateEngine {
       this.templates.set(templateID, compiled)
 
       if (this.config.debug) {
-        console.log(`[TemplateEngine] Loaded template: ${templateID}`)
+        promptLogger.debug("[TemplateEngine] Loaded template", { templateID })
       }
 
       return compiled
 
     } catch (error) {
-      console.warn(`[TemplateEngine] Template '${templateID}' not found, using default`)
+      promptLogger.warn(`[TemplateEngine] Template '${templateID}' not found, using default`, error)
       return this.defaultTemplate!
     }
   }
@@ -101,7 +102,7 @@ export class TemplateEngine {
     Handlebars.registerHelper("lowercase", (str: string) => str?.toLowerCase() || "")
 
     if (this.config.debug) {
-      console.log("[TemplateEngine] Registered custom helpers")
+      promptLogger.debug("[TemplateEngine] Registered custom helpers")
     }
   }
 
@@ -111,7 +112,7 @@ export class TemplateEngine {
   clearCache(): void {
     this.templates.clear()
     if (this.config.debug) {
-      console.log("[TemplateEngine] Cache cleared")
+      promptLogger.debug("[TemplateEngine] Cache cleared")
     }
   }
 }

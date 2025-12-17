@@ -1,5 +1,6 @@
 import { readFile } from "fs/promises"
 import { existsSync } from "fs"
+import { promptLogger } from "../logger"
 
 export interface Experiment {
   id: string
@@ -45,10 +46,12 @@ export class ExperimentManager {
       this.config = JSON.parse(content)
 
       if (this.opts.debug) {
-        console.log(`[ExperimentManager] Loaded ${this.config!.experiments.length} experiments`)
+        promptLogger.debug("[ExperimentManager] Loaded experiments", {
+          count: this.config!.experiments.length,
+        })
       }
     } catch (error) {
-      console.error("[ExperimentManager] Failed to load experiments:", error)
+      promptLogger.error("[ExperimentManager] Failed to load experiments", error)
       this.config = { experiments: [] }
     }
   }

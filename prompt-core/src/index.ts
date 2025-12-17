@@ -12,6 +12,7 @@ export { LocalResolver } from "./local/manager"
 import { ResolverFactory } from "./resolver"
 import { PromptCache } from "./cache"
 import type { PromptConfig, PromptContext, ResolvedPrompt } from "./types"
+import { configurePromptLogger, promptLogger } from "./logger"
 
 /**
  * TmuxCoder Prompt SDK main entry point
@@ -23,6 +24,10 @@ export class TmuxCoderPrompts {
 
   constructor(private config: PromptConfig) {
     this.cache = new PromptCache(config.cache || { enabled: false })
+    configurePromptLogger({
+      filePath: config.logging?.filePath,
+      debug: config.debug,
+    })
   }
 
   async initialize(): Promise<void> {
@@ -33,12 +38,10 @@ export class TmuxCoderPrompts {
     await this.resolver.initialize()
     this.initialized = true
 
-    if (this.config.debug) {
-      console.log("[TmuxCoderPrompts] SDK initialized", {
-        mode: this.config.mode,
-        cacheEnabled: this.config.cache?.enabled,
-      })
-    }
+    promptLogger.debug("[TmuxCoderPrompts] SDK initialized", {
+      mode: this.config.mode,
+      cacheEnabled: this.config.cache?.enabled,
+    })
   }
 
   async resolve(context: PromptContext): Promise<ResolvedPrompt> {
@@ -54,9 +57,7 @@ export class TmuxCoderPrompts {
     const cached = this.cache.get(cacheKey)
 
     if (cached) {
-      if (this.config.debug) {
-        console.log("[TmuxCoderPrompts] Cache hit:", cacheKey)
-      }
+      promptLogger.debug("[TmuxCoderPrompts] Cache hit", { cacheKey })
       return cached
     }
 

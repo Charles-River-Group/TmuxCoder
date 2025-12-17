@@ -1,4 +1,5 @@
 import type { ResolvedPrompt } from "./types"
+import { promptLogger } from "./logger"
 
 export interface CacheEntry {
   value: ResolvedPrompt
@@ -86,7 +87,7 @@ export class PromptCache {
     }
 
     if (deletedCount > 0) {
-      console.log(`[PromptCache] Cleaned up ${deletedCount} expired entries`)
+      promptLogger.info("[PromptCache] Cleaned up expired entries", { deletedCount })
     }
   }
 
