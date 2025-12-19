@@ -87,7 +87,10 @@ export interface PromptConfig {
   }
 
   logging?: {
+    level?: string                  // "debug" | "info" | "warn" | "error"
     filePath?: string
+    enableMetrics?: boolean
+    enableTracing?: boolean
   }
 
   // Debug mode

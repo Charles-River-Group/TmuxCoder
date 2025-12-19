@@ -1,7 +1,9 @@
 You are an AI assistant for {{project_name}}.
 
 Current context:
-- Directory: {{project_path}}
+- Project Directory: {{project_path}}
+{{#if sessionDirectory}}- Session Directory: {{sessionDirectory}}
+{{/if}}
 - Git Branch: {{git_branch}}
 - Modified: {{#if git_dirty}}Yes{{else}}No{{/if}}
 - Timestamp: {{timestamp}}
