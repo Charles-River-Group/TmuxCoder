@@ -93,6 +93,31 @@ export interface PromptConfig {
     enableTracing?: boolean
   }
 
+  // Provider configuration
+  providers?: {
+    git?: {
+      enabled?: boolean
+      timeout?: number              // milliseconds
+      cache?: {
+        git_root?: number           // TTL in milliseconds
+        git_branch?: number
+        git_dirty?: number
+      }
+    }
+    time?: {
+      enabled?: boolean
+    }
+    system?: {
+      enabled?: boolean
+    }
+    custom?: {
+      enabled?: boolean
+      directory?: string            // Custom providers directory
+      namespace?: string            // Namespace prefix for custom variables
+      watch?: boolean               // Enable hot-reload (experimental)
+    }
+  }
+
   // Debug mode
   debug?: boolean
 }

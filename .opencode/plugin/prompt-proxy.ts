@@ -4,6 +4,12 @@ import type { PromptConfig, PromptContext } from "@tmuxcoder/prompt-core"
 import { join } from "path"
 import { existsSync } from "fs"
 import { promptProxyLogger as logger, parseLogLevel } from "./logger"
+import {
+  loadCustomProviders,
+  resolveContextVariables,
+  setProviderConfig,
+  getAvailableVariables,
+} from "./variable-providers"
 
 // ========== Monkey Patch SystemPrompt ==========
 // Import SystemPrompt module for monkey patching
@@ -21,12 +27,12 @@ try {
   const originalCustom = SystemPrompt.custom
 
   // Replace with no-op functions
-  SystemPrompt.environment = async function() {
+  SystemPrompt.environment = async function () {
     logger.debug("SystemPrompt.environment() intercepted - returning empty", { module: "SystemPrompt" })
     return []
   }
 
-  SystemPrompt.custom = async function() {
+  SystemPrompt.custom = async function () {
     logger.debug("SystemPrompt.custom() intercepted - returning empty", { module: "SystemPrompt" })
     return []
   }
@@ -90,8 +96,25 @@ export const PromptProxy: Plugin = async ({ project, directory, worktree, $ }) =
   // Load configuration from found root
   const config = await loadConfig(configRoot)
 
+  // Configure providers based on config
+  if (config.providers) {
+    setProviderConfig(config.providers)
+    logger.info("Provider configuration applied", { providers: config.providers })
+  }
+
   // Store configRoot for use in hooks
   const projectRoot = configRoot
+
+  // Load custom providers (respecting config.providers.custom settings)
+  const customConfig = config.providers?.custom
+  const providersDir = customConfig?.directory
+    ? join(projectRoot, customConfig.directory)
+    : join(projectRoot, ".opencode/prompts/providers")
+
+  const customProviders = (customConfig?.enabled !== false)
+    ? await loadCustomProviders(providersDir)
+    : {}
+  const customProviderCount = Object.keys(customProviders).length
 
   // Configure logger based on config
   if (config.logging?.level) {
@@ -102,10 +125,33 @@ export const PromptProxy: Plugin = async ({ project, directory, worktree, $ }) =
   const prompts = new TmuxCoderPrompts(config)
   await prompts.initialize()
 
+  // Get available variables and log for user visibility
+  const availableVars = getAvailableVariables()
+
   logger.info("Initialized", {
     mode: config.mode,
     templatesDir: config.local?.templatesDir,
     cacheEnabled: config.cache?.enabled,
+    customProviders: customProviderCount,
+    providersEnabled: {
+      git: config.providers?.git?.enabled !== false,
+      time: config.providers?.time?.enabled !== false,
+      system: config.providers?.system?.enabled !== false,
+      custom: customConfig?.enabled !== false,
+    },
+  })
+
+  // Log available variables for easy discovery
+  logger.info("📋 Available template variables", {
+    total: availableVars.total + customProviderCount,
+    builtIn: availableVars.builtIn,
+    customProviders: Object.keys(customProviders),
+  })
+
+  logger.info("💡 Quick tips", {
+    variablesReference: ".opencode/prompts/VARIABLES.txt",
+    templateComments: "Check .opencode/prompts/templates/*.txt for inline help",
+    fullDocumentation: "docs/AVAILABLE_VARIABLES.md",
   })
 
   // Create parameter cache (for passing data between hooks)
@@ -129,6 +175,17 @@ export const PromptProxy: Plugin = async ({ project, directory, worktree, $ }) =
       const hookTimeout = 15000
 
       const executeHook = async () => {
+        // Resolve custom variables (built-ins + custom)
+        const customContext = await resolveContextVariables(
+          {
+            worktree: projectRoot,
+            $: $,
+            env: process.env,
+            sessionID,
+          },
+          customProviders
+        )
+
         // Build context
         const context: PromptContext = {
           agent,
@@ -139,14 +196,14 @@ export const PromptProxy: Plugin = async ({ project, directory, worktree, $ }) =
           },
           model: model
             ? {
-                providerID: model.providerID,
-                modelID: model.modelID,
-              }
+              providerID: model.providerID,
+              modelID: model.modelID,
+            }
             : undefined,
-          git: await getGitInfo(projectRoot, $),
           environment: {
             NODE_ENV: process.env.NODE_ENV,
             sessionDirectory: directory,
+            ...customContext,
           },
         }
 
@@ -154,8 +211,9 @@ export const PromptProxy: Plugin = async ({ project, directory, worktree, $ }) =
           sessionID: sessionIDShort,
           projectName: context.project?.name,
           projectPath: context.project?.path,
-          gitBranch: context.git?.branch,
-          gitDirty: context.git?.isDirty,
+          gitBranch: customContext.git_branch,
+          gitDirty: customContext.git_dirty,
+          customProviders: customProviderCount,
           sessionDirectory: directory,
         })
 
@@ -358,46 +416,6 @@ async function loadConfig(directory: string): Promise<PromptConfig> {
   return defaultConfig
 }
 
-/**
- * Get Git information with timeout
- */
-async function getGitInfo(worktree: string, $: any) {
-  try {
-    // Add 5 second timeout to prevent hanging
-    const timeoutMs = 5000
-
-    const branchPromise = $`git -C ${worktree} branch --show-current`.text()
-    const statusPromise = $`git -C ${worktree} status --short`.text()
-
-    const branch = await Promise.race([
-      branchPromise,
-      new Promise((_, reject) =>
-        setTimeout(() => reject(new Error("Git branch command timeout")), timeoutMs)
-      )
-    ]) as string
-
-    const status = await Promise.race([
-      statusPromise,
-      new Promise((_, reject) =>
-        setTimeout(() => reject(new Error("Git status command timeout")), timeoutMs)
-      )
-    ]) as string
-
-    return {
-      branch: branch.trim(),
-      isDirty: status.trim().length > 0,
-    }
-  } catch (error) {
-    logger.warn("Git command failed or timed out", {
-      worktree,
-      error: error instanceof Error ? error.message : String(error),
-    })
-    return {
-      branch: "unknown",
-      isDirty: false,
-    }
-  }
-}
 
 /**
  * Extract project name from directory path
