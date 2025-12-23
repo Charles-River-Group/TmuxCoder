@@ -1,15 +1,18 @@
 import type { Plugin } from "@opencode-ai/plugin"
 import { TmuxCoderPrompts } from "@tmuxcoder/prompt-core"
 import type { PromptConfig, PromptContext } from "@tmuxcoder/prompt-core"
-import { join } from "path"
+import { join, resolve } from "path"
 import { existsSync } from "fs"
-import { promptProxyLogger as logger, parseLogLevel } from "./logger"
+import { promptProxyLogger as logger, parseLogLevel } from "../lib/logger"
 import {
   loadCustomProviders,
   resolveContextVariables,
   setProviderConfig,
   getAvailableVariables,
-} from "./variable-providers"
+} from "../lib/variable-providers"
+
+const PROMPT_PROXY_ENV = "TMUXCODER_PROMPT_PROXY"
+const MONKEY_PATCH_ENV = "TMUXCODER_MONKEY_PATCH"
 
 // ========== SystemPrompt Monkey Patch Support ==========
 let SystemPrompt: any = null
@@ -153,12 +156,32 @@ export const PromptProxy: Plugin = async ({ project, directory, worktree, $ }) =
     }
 
     if (!found) {
-      logger.warn(".opencode/prompts not found, using worktree", { worktree })
+      const envConfigDir = process.env.OPENCODE_CONFIG_DIR
+      if (envConfigDir) {
+        const envRoot = envConfigDir.endsWith(".opencode")
+          ? resolve(envConfigDir, "..")
+          : envConfigDir
+        if (existsSync(join(envRoot, ".opencode/prompts"))) {
+          configRoot = envRoot
+          logger.info("Using OPENCODE_CONFIG_DIR parent for prompts", { configRoot })
+        }
+      }
+
+      if (configRoot === worktree) {
+        const envRoot = process.env.TMUXCODER_ROOT
+        if (envRoot && existsSync(join(envRoot, ".opencode/prompts"))) {
+          configRoot = envRoot
+          logger.info("Using TMUXCODER_ROOT for .opencode/prompts", { configRoot })
+        } else {
+          logger.warn(".opencode/prompts not found, using worktree", { worktree })
+        }
+      }
     }
   }
 
   // Load configuration from found root
   const config = await loadConfig(configRoot)
+  const envOverrides = applyEnvironmentOverrides(config)
   const proxyControls = getProxyControls(config)
   monkeyPatchApplied = applyMonkeyPatch(config)
 
@@ -166,6 +189,7 @@ export const PromptProxy: Plugin = async ({ project, directory, worktree, $ }) =
     monkeyPatchActive: monkeyPatchApplied,
     directory,
     worktree,
+    envOverrides,
     promptProxy: proxyControls,
   })
 
@@ -527,6 +551,67 @@ async function loadConfig(directory: string): Promise<PromptConfig> {
 function getProjectName(dirPath: string): string {
   const parts = dirPath.split("/")
   return parts[parts.length - 1] || "unknown"
+}
+
+type EnvOverrideSummary = {
+  promptProxy?: boolean
+  monkeyPatch?: boolean
+}
+
+function applyEnvironmentOverrides(config: PromptConfig): EnvOverrideSummary {
+  const summary: EnvOverrideSummary = {}
+
+  const promptProxyOverride = parseEnvToggle(process.env[PROMPT_PROXY_ENV])
+  if (promptProxyOverride !== null) {
+    const current = { ...(config.promptProxy ?? {}) }
+    current.enabled = promptProxyOverride
+    if (promptProxyOverride) {
+      current.overrideSystem = true
+      current.overrideParams = true
+    } else {
+      current.overrideSystem = false
+      current.overrideParams = false
+    }
+    config.promptProxy = current
+    summary.promptProxy = promptProxyOverride
+  }
+
+  const monkeyPatchOverride = parseEnvToggle(process.env[MONKEY_PATCH_ENV])
+  if (monkeyPatchOverride !== null) {
+    config.monkeyPatch = {
+      ...(config.monkeyPatch ?? {}),
+      enabled: monkeyPatchOverride,
+    }
+    summary.monkeyPatch = monkeyPatchOverride
+  }
+
+  if (summary.promptProxy !== undefined || summary.monkeyPatch !== undefined) {
+    logger.info("Environment overrides detected", summary)
+  }
+
+  return summary
+}
+
+function parseEnvToggle(value?: string | null): boolean | null {
+  if (!value) return null
+
+  const normalized = value.trim().toLowerCase()
+  if (normalized === "" || normalized === "auto") {
+    return null
+  }
+
+  if (["on", "true", "1", "yes", "enable", "enabled"].includes(normalized)) {
+    return true
+  }
+
+  if (["off", "false", "0", "no", "disable", "disabled"].includes(normalized)) {
+    return false
+  }
+
+  logger.warn("Ignoring invalid environment toggle", {
+    value,
+  })
+  return null
 }
 
 function getProxyControls(config: PromptConfig) {

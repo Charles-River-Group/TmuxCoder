@@ -56,6 +56,17 @@ func NewApp() *App {
 		os.Exit(1)
 	}
 
+	// Propagate project metadata to child processes
+	if os.Getenv("TMUXCODER_ROOT") == "" {
+		_ = os.Setenv("TMUXCODER_ROOT", projectRoot)
+	}
+	configDir := filepath.Join(projectRoot, ".opencode")
+	if os.Getenv("OPENCODE_CONFIG_DIR") == "" {
+		if info, err := os.Stat(configDir); err == nil && info.IsDir() {
+			_ = os.Setenv("OPENCODE_CONFIG_DIR", configDir)
+		}
+	}
+
 	return &App{
 		projectRoot:    projectRoot,
 		binPath:        binPath,
