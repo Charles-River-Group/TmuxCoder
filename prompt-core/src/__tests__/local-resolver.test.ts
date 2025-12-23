@@ -13,7 +13,6 @@ describe("LocalResolver", () => {
       local: {
         templatesDir: join(__dirname, "../../fixtures/templates"),
         parametersPath: join(__dirname, "../../fixtures/parameters.json"),
-        experimentsPath: join(__dirname, "../../fixtures/experiments.json"),
       },
       debug: false,
     }
@@ -67,29 +66,6 @@ describe("LocalResolver", () => {
     expect(result.system).toContain("test-project")
   })
 
-  it("should allocate variants consistently", async () => {
-    const sessionID = "consistent-session"
-
-    const result1 = await resolver.resolve({
-      agent: "coder",
-      sessionID,
-      project: {
-        name: "test-project",
-        path: "/test/path",
-      },
-    })
-    const result2 = await resolver.resolve({
-      agent: "coder",
-      sessionID,
-      project: {
-        name: "test-project",
-        path: "/test/path",
-      },
-    })
-
-    expect(result1.metadata.variantID).toBe(result2.metadata.variantID)
-  })
-
   it("should handle missing optional config gracefully", async () => {
     const minimalConfig: PromptConfig = {
       mode: "local",
@@ -130,20 +106,5 @@ describe("LocalResolver", () => {
 
     expect(result.system).toContain("my-project")
     expect(result.system).toContain("claude-sonnet-4")
-  })
-
-  it("should apply experiment variants", async () => {
-    // Test with a session that should get variant-a
-    const result = await resolver.resolve({
-      agent: "coder",
-      sessionID: "variant-test-session",
-    })
-
-    // Verify experiment metadata is present
-    expect(result.metadata.experimentID).toBe("test-exp")
-    expect(result.metadata.variantID).toBeTruthy()
-
-    // Temperature should be from variant (0.5 or 0.7)
-    expect([0.5, 0.7]).toContain(result.parameters.temperature)
   })
 })

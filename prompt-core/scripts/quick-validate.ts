@@ -5,7 +5,6 @@
  */
 
 import { TmuxCoderPrompts } from "../src/index"
-import { ExperimentManager } from "../src/local/experiments"
 import { join } from "path"
 
 const PASS = "✅"
@@ -28,7 +27,6 @@ async function main() {
       local: {
         templatesDir: join(__dirname, "../fixtures/templates"),
         parametersPath: join(__dirname, "../fixtures/parameters.json"),
-        experimentsPath: join(__dirname, "../fixtures/experiments.json"),
       },
       cache: { enabled: true, ttl: 300 },
     })
@@ -95,107 +93,14 @@ async function main() {
     failed++
   }
 
-  // Test 3: Experiment Allocation Consistency
-  console.log("\n3️⃣  Testing Experiment Allocation...")
-  try {
-    const manager = new ExperimentManager({
-      configPath: join(__dirname, "../fixtures/experiments.json"),
-    })
-    await manager.initialize()
-
-    const experiment = manager.findActiveExperiment("coder", "any-session")
-
-    if (!experiment) {
-      console.log(`${WARN} No active experiments found (this is OK if no experiments configured)`)
-      warnings++
-    } else {
-      const sessionID = "consistency-test"
-
-      // Allocate variant 10 times
-      const variants = []
-      for (let i = 0; i < 10; i++) {
-        variants.push(manager.allocateVariant(experiment, sessionID))
-      }
-
-      // All should be the same
-      const allSame = variants.every(v => v === variants[0])
-
-      if (allSame) {
-        console.log(`${PASS} Variant allocation is consistent (all assigned: ${variants[0]})`)
-        passed++
-      } else {
-        console.log(`${FAIL} Variant allocation is NOT consistent:`, variants)
-        failed++
-      }
-    }
-  } catch (error) {
-    console.log(`${FAIL} Experiment test failed:`, error)
-    failed++
-  }
-
-  // Test 4: Experiment Distribution
-  console.log("\n4️⃣  Testing Experiment Distribution...")
-  try {
-    const manager = new ExperimentManager({
-      configPath: join(__dirname, "../fixtures/experiments.json"),
-    })
-    await manager.initialize()
-
-    const experiment = manager.findActiveExperiment("coder", "any-session")
-
-    if (!experiment) {
-      console.log(`${WARN} Skipping distribution test (no experiments)`)
-      warnings++
-    } else {
-      const assignments: Record<string, number> = {}
-
-      // Simulate 1000 sessions
-      for (let i = 0; i < 1000; i++) {
-        const variant = manager.allocateVariant(experiment, `session-${i}`)
-        assignments[variant] = (assignments[variant] || 0) + 1
-      }
-
-      console.log("   Distribution:")
-      let maxError = 0
-
-      for (const [variant, count] of Object.entries(assignments)) {
-        const actualPercent = (count / 1000) * 100
-        const expectedPercent = experiment.allocation[variant] * 100
-        const error = Math.abs(actualPercent - expectedPercent)
-        maxError = Math.max(maxError, error)
-
-        const status = error < 5 ? PASS : error < 10 ? WARN : FAIL
-        console.log(
-          `   ${status} ${variant.padEnd(12)}: ${count.toString().padStart(3)} ` +
-          `(${actualPercent.toFixed(1)}% vs ${expectedPercent.toFixed(1)}%, error: ${error.toFixed(1)}%)`
-        )
-      }
-
-      if (maxError < 5) {
-        console.log(`${PASS} Distribution is good (max error: ${maxError.toFixed(2)}%)`)
-        passed++
-      } else if (maxError < 10) {
-        console.log(`${WARN} Distribution is acceptable (max error: ${maxError.toFixed(2)}%)`)
-        warnings++
-      } else {
-        console.log(`${FAIL} Distribution is poor (max error: ${maxError.toFixed(2)}%)`)
-        failed++
-      }
-    }
-  } catch (error) {
-    console.log(`${FAIL} Distribution test failed:`, error)
-    failed++
-  }
-
-  // Test 5: Parameter Precedence
-  console.log("\n5️⃣  Testing Parameter Precedence...")
+  // Test 3: Parameter Precedence
+  console.log("\n3️⃣  Testing Parameter Precedence...")
   try {
     const sdk = new TmuxCoderPrompts({
       mode: "local",
       local: {
         templatesDir: join(__dirname, "../fixtures/templates"),
         parametersPath: join(__dirname, "../fixtures/parameters.json"),
-        experimentsPath: join(__dirname, "../fixtures/experiments.json"),
       },
     })
     await sdk.initialize()
@@ -220,15 +125,14 @@ async function main() {
     failed++
   }
 
-  // Test 6: Performance (Latency)
-  console.log("\n6️⃣  Testing Performance...")
+  // Test 4: Performance (Latency)
+  console.log("\n4️⃣  Testing Performance...")
   try {
     const sdk = new TmuxCoderPrompts({
       mode: "local",
       local: {
         templatesDir: join(__dirname, "../fixtures/templates"),
         parametersPath: join(__dirname, "../fixtures/parameters.json"),
-        experimentsPath: join(__dirname, "../fixtures/experiments.json"),
       },
       cache: { enabled: true },
       debug: false,
@@ -276,8 +180,8 @@ async function main() {
     failed++
   }
 
-  // Test 7: Error Handling
-  console.log("\n7️⃣  Testing Error Handling...")
+  // Test 5: Error Handling
+  console.log("\n5️⃣  Testing Error Handling...")
   try {
     const sdk = new TmuxCoderPrompts({
       mode: "local",

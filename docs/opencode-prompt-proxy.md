@@ -2,8 +2,8 @@
 
 ## 1. Background & Constraints
 - **Leave OpenCode untouched**: `packages/opencode` remains a read-only submodule so upstream updates can land without conflict.
-- **Externalized prompts**: System prompts, model parameters, and experiments live in plugin-managed files that are version-controlled, reviewable, and easy to roll back.
-- **Project-level isolation**: Each worktree owns its own `.opencode/` folder, which keeps template experiments scoped per project or per environment.
+- **Externalized prompts**: System prompts and model parameters live in plugin-managed files that are version-controlled, reviewable, and easy to roll back.
+- **Project-level isolation**: Each worktree owns its own `.opencode/` folder, which keeps template overrides scoped per project or per environment.
 
 ## 2. High-Level Topology
 ```
@@ -14,10 +14,10 @@
                                                       │templates/     │parameters/
                                                       ▼               ▼
                                              .opencode/prompts/templates/*.txt
-                                             .opencode/prompts/{parameters,experiments}.json
+                                             .opencode/prompts/parameters.json
 ```
 - OpenCode invokes `chat.message` / `chat.params` hooks; the plugin decides the final system prompt and model parameters.
-- The Prompt-core SDK renders templates, applies experiments, and merges parameters; additional resolver modes (remote/hybrid) can be added without touching OpenCode.
+- The Prompt-core SDK renders templates and merges parameters; additional resolver modes (remote/hybrid) can be added without touching OpenCode.
 
 ## 3. Key Components
 1. **Prompt Proxy Plugin** (`.opencode/plugin/prompt-proxy.ts`)
@@ -30,10 +30,9 @@
    - `TmuxCoderPrompts` manages resolver lifecycle plus an in-memory cache so multiple hooks in the same session reuse results.
    - `LocalResolver` composes:
      - `TemplateEngine`: Handlebars templates per agent (`templates/<agent>.txt`) with helpers such as `formatDate` and `uppercase`.
-     - `ExperimentManager`: Loads `experiments.json`, hashes `sessionID` for sticky allocation, and layers experiment-specific parameters.
-     - `ParameterManager`: Folds parameters in the order **defaults → model → agent → experiment**.
+     - `ParameterManager`: Folds parameters in the order **defaults → model → agent**.
 3. **Configuration assets** (`.opencode/prompts`)
-   - `templates/`, `parameters.json`, and `experiments.json` are all Git-friendly, enabling change reviews and audit trails.
+   - `templates/` and `parameters.json` are Git-friendly, enabling change reviews and audit trails.
    - `config.json` controls resolver mode plus cache TTL/size, allowing per-project overrides.
 
 ## 4. Detailed Project Flow
@@ -45,11 +44,9 @@ flowchart LR
     D -- Yes --> E["Return cached<br/>system + params"]
     D -- No --> F["LocalResolver pipeline"]
     F --> F1["TemplateEngine renders<br/>agent template with context"]
-    F --> F2["ExperimentManager selects<br/>experiment variant"]
-    F --> F3["ParameterManager merges<br/>defaults → model → agent → variant"]
+    F --> F2["ParameterManager merges<br/>defaults → model → agent"]
     F1 --> G["Compose ResolvedPrompt<br/>{system, parameters, metadata}"]
     F2 --> G
-    F3 --> G
     G --> H["Plugin overrides output.message.system<br/>and caches parameters by session ID"]
     H --> I["OpenCode fires chat.params"]
     I --> J["Plugin mutates temperature/topP/options"]
@@ -58,9 +55,9 @@ flowchart LR
 ```
 
 ## 5. Isolation & Versioning Strategy
-- **Isolation**: `.opencode/prompts` is scoped to the repo/worktree, so experiments or overrides never leak across projects. CI agents can vend project-specific bundles by copying this directory.
+- **Isolation**: `.opencode/prompts` is scoped to the repo/worktree, so overrides never leak across projects. CI agents can vend project-specific bundles by copying this directory.
 - **Version control**: Templates and JSON configs change through regular pull requests, ensuring prompt adjustments are reviewed, traceable, and easy to revert.
-- **Experimentation**: `experiments.json` supports multi-variant traffic splits. Session-ID hashing keeps allocations sticky, enabling gradual rollouts and instant rollback by flipping the config.
+- **Prompt Proxy toggles**: `promptProxy.enabled/overrideSystem/overrideParams` let you switch back to vanilla OpenCode behavior for quick comparisons without uninstalling the plugin.
 
 ## 6. Extending Variables (Variable Providers)
 Hardcoded variables (like `{{timestamp}}`) are replaced by an extensible provider system in `.opencode/plugin/variable-providers.ts`.
@@ -92,6 +89,6 @@ Hardcoded variables (like `{{timestamp}}`) are replaced by an extensible provide
 
 ## 7. Extension Opportunities
 - **Remote mode**: `PromptConfig.mode` already reserves `remote`/`hybrid`; swapping `LocalResolver` for an HTTP resolver requires zero OpenCode changes and keeps local files as fallback.
-- **Observability**: The plugin can emit structured logs or forward telemetry to shared sinks (example uses `console.log`) to trace which template/variant applied to each session.
+- **Observability**: The plugin can emit structured logs or forward telemetry to shared sinks (example uses `console.log`) to trace which template and parameter set applied to each session.
 - **Security**: For cross-team deployments, add allowlists or signature checks inside the plugin to ensure only trusted template bundles are loaded.
 ***

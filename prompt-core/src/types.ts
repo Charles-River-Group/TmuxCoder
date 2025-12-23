@@ -46,8 +46,6 @@ export interface ResolvedPrompt {
   metadata: {
     templateID: string             // Template ID used
     templateVersion?: string       // Template version
-    variantID?: string             // A/B test variant
-    experimentID?: string          // Experiment ID
     resolverType: "local" | "remote" | "hybrid"
     resolvedAt: string             // ISO timestamp
   }
@@ -81,7 +79,6 @@ export interface PromptConfig {
   // Local configuration
   local?: {
     templatesDir: string
-    experimentsPath?: string
     parametersPath?: string
   }
 

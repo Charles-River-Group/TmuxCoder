@@ -1,6 +1,5 @@
 import { readFile } from "fs/promises"
 import { existsSync } from "fs"
-import type { Experiment } from "./experiments"
 import { promptLogger } from "../logger"
 
 export interface ParametersConfig {
@@ -54,20 +53,18 @@ export class ParameterManager {
   }
 
   /**
-   * Resolve parameters (priority: experiment variant > agent > model > global defaults)
+   * Resolve parameters (priority: agent > model > global defaults)
    */
   resolve(opts: {
     agent: string
     model?: string
-    experiment?: Experiment | null
-    variantID?: string
   }): {
     temperature?: number
     topP?: number
     maxTokens?: number
     options?: Record<string, any>
   } {
-    const { agent, model, experiment, variantID } = opts
+    const { agent, model } = opts
 
     // Start with global defaults
     let params = { ...this.config?.defaults }
@@ -80,11 +77,6 @@ export class ParameterManager {
     // Apply agent config
     if (this.config?.agents?.[agent]) {
       params = { ...params, ...this.config.agents[agent] }
-    }
-
-    // Apply experiment variant config (highest priority)
-    if (experiment && variantID && experiment.variants[variantID]) {
-      params = { ...params, ...experiment.variants[variantID] }
     }
 
     return params

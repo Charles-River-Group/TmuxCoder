@@ -1,13 +1,11 @@
 import { PromptResolver } from "../resolver"
 import type { PromptContext, ResolvedPrompt, PromptConfig } from "../types"
 import { TemplateEngine } from "./template"
-import { ExperimentManager } from "./experiments"
 import { ParameterManager } from "./parameters"
 import { promptLogger } from "../logger"
 
 export class LocalResolver extends PromptResolver {
   private templateEngine!: TemplateEngine
-  private experimentManager!: ExperimentManager
   private parameterManager!: ParameterManager
   private initialized = false
 
@@ -30,18 +28,6 @@ export class LocalResolver extends PromptResolver {
       debug: this.config.debug,
     })
     await this.templateEngine.initialize()
-
-    // Initialize experiment manager
-    if (local!.experimentsPath) {
-      this.experimentManager = new ExperimentManager({
-        configPath: local!.experimentsPath,
-        debug: this.config.debug,
-      })
-      await this.experimentManager.initialize()
-    } else {
-      this.experimentManager = new ExperimentManager({ configPath: "" })
-      await this.experimentManager.initialize()
-    }
 
     // Initialize parameter manager
     if (local!.parametersPath) {
@@ -73,37 +59,24 @@ export class LocalResolver extends PromptResolver {
       // 1. Enrich context (add runtime information)
       const enrichedContext = await this.enrichContext(context)
 
-      // 2. Check for active experiments
-      const experiment = this.experimentManager.findActiveExperiment(
-        context.agent,
-        context.sessionID
-      )
-      const variantID = experiment
-        ? this.experimentManager.allocateVariant(experiment, context.sessionID)
-        : "default"
-
-      // 3. Resolve template
+      // 2. Resolve template
       const systemPrompt = await this.templateEngine.render(
         context.agent,
         enrichedContext
       )
 
-      // 4. Resolve parameters
+      // 3. Resolve parameters
       const parameters = this.parameterManager.resolve({
         agent: context.agent,
         model: context.model?.modelID,
-        experiment,
-        variantID,
       })
 
-      // 5. Build result
+      // 4. Build result
       const resolved: ResolvedPrompt = {
         system: systemPrompt,
         parameters,
         metadata: {
           templateID: context.agent,
-          variantID,
-          experimentID: experiment?.id,
           resolverType: "local",
           resolvedAt: new Date().toISOString(),
         },
@@ -113,7 +86,6 @@ export class LocalResolver extends PromptResolver {
         const elapsed = Date.now() - startTime
         promptLogger.debug("[LocalResolver] Resolved prompt", {
           agent: context.agent,
-          variantID,
           temperature: parameters.temperature,
           durationMs: elapsed,
         })

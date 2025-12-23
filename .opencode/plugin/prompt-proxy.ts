@@ -471,7 +471,6 @@ async function loadConfig(directory: string): Promise<PromptConfig> {
     local: {
       templatesDir: join(directory, ".opencode/prompts/templates"),
       parametersPath: join(directory, ".opencode/prompts/parameters.json"),
-      experimentsPath: join(directory, ".opencode/prompts/experiments.json"),
     },
     cache: {
       enabled: true,

@@ -13,8 +13,7 @@
 
   "local": {
     "templatesDir": ".opencode/prompts/templates",
-    "parametersPath": ".opencode/prompts/parameters.json",
-    "experimentsPath": ".opencode/prompts/experiments.json"
+    "parametersPath": ".opencode/prompts/parameters.json"
   },
 
   "cache": {
