@@ -130,9 +130,9 @@ USAGE:
     tmuxcoder [GLOBAL OPTIONS] [COMMAND] [OPTIONS]
 
 GLOBAL OPTIONS:
-    --layout <path>         Override layout config (sets OPENCODE_TMUX_CONFIG)
-    --prompt-proxy <mode>   Force Prompt Proxy (on/off/auto). Use --no-prompt-proxy as shorthand for off.
-    --monkey-patch <mode>   Force SystemPrompt monkey patch (on/off/auto). Use --no-monkey-patch for off.
+    --layout <path>              Override layout config (sets OPENCODE_TMUX_CONFIG)
+    --custom-sp <mode>           Force custom system prompt (on/off/auto). Use --no-custom-sp as shorthand for off.
+    --clean-default-env-sp <mode> Clean default environment system prompt (on/off/auto). Use --no-clean-default-env-sp for off.
 
 COMMANDS:
     (no command)           Smart start - auto-detect session and attach
@@ -174,21 +174,21 @@ BEHAVIOR:
     - Reuses existing sessions intelligently
 
 ENVIRONMENT VARIABLES:
-    TMUXCODER_ROOT            Project root directory
-    OPENCODE_SERVER           OpenCode API server URL
-    OPENCODE_TMUX_CONFIG      Config file (default: ~/.opencode/tmux.yaml)
-    TMUXCODER_PROMPT_PROXY    Force Prompt Proxy (on/off)
-    TMUXCODER_MONKEY_PATCH    Force SystemPrompt monkey patch (on/off)
+    TMUXCODER_ROOT                   Project root directory
+    OPENCODE_SERVER                  OpenCode API server URL
+    OPENCODE_TMUX_CONFIG             Config file (default: ~/.opencode/tmux.yaml)
+    TMUXCODER_CUSTOM_SP              Force custom system prompt (on/off)
+    TMUXCODER_CLEAN_DEFAULT_ENV_SP   Clean default environment system prompt (on/off)
 
 `
 	fmt.Print(help)
 }
 
 type globalOptions struct {
-	layoutPath  string
-	serverURL   string
-	promptProxy string
-	monkeyPatch string
+	layoutPath         string
+	serverURL          string
+	customSP           string
+	cleanDefaultEnvSP  string
 }
 
 func parseGlobalOptions(args []string) ([]string, globalOptions, error) {
@@ -243,8 +243,8 @@ func parseGlobalOptions(args []string) ([]string, globalOptions, error) {
 			continue
 		}
 
-		if arg == "--prompt-proxy" || strings.HasPrefix(arg, "--prompt-proxy=") {
-			value, err := getFlagValue(args, &i, arg, "--prompt-proxy")
+		if arg == "--custom-sp" || strings.HasPrefix(arg, "--custom-sp=") {
+			value, err := getFlagValue(args, &i, arg, "--custom-sp")
 			if err != nil {
 				return nil, opts, err
 			}
@@ -252,17 +252,17 @@ func parseGlobalOptions(args []string) ([]string, globalOptions, error) {
 			if err != nil {
 				return nil, opts, err
 			}
-			opts.promptProxy = normalized
+			opts.customSP = normalized
 			continue
 		}
 
-		if arg == "--no-prompt-proxy" {
-			opts.promptProxy = "off"
+		if arg == "--no-custom-sp" {
+			opts.customSP = "off"
 			continue
 		}
 
-		if arg == "--monkey-patch" || strings.HasPrefix(arg, "--monkey-patch=") {
-			value, err := getFlagValue(args, &i, arg, "--monkey-patch")
+		if arg == "--clean-default-env-sp" || strings.HasPrefix(arg, "--clean-default-env-sp=") {
+			value, err := getFlagValue(args, &i, arg, "--clean-default-env-sp")
 			if err != nil {
 				return nil, opts, err
 			}
@@ -270,12 +270,12 @@ func parseGlobalOptions(args []string) ([]string, globalOptions, error) {
 			if err != nil {
 				return nil, opts, err
 			}
-			opts.monkeyPatch = normalized
+			opts.cleanDefaultEnvSP = normalized
 			continue
 		}
 
-		if arg == "--no-monkey-patch" {
-			opts.monkeyPatch = "off"
+		if arg == "--no-clean-default-env-sp" {
+			opts.cleanDefaultEnvSP = "off"
 			continue
 		}
 
@@ -348,11 +348,11 @@ func applyGlobalOptions(opts globalOptions) error {
 		fmt.Printf("Using OpenCode server: %s\n", opts.serverURL)
 	}
 
-	if err := applyToggleOverride("TMUXCODER_PROMPT_PROXY", opts.promptProxy, "Prompt Proxy"); err != nil {
+	if err := applyToggleOverride("TMUXCODER_CUSTOM_SP", opts.customSP, "Custom SP"); err != nil {
 		return err
 	}
 
-	if err := applyToggleOverride("TMUXCODER_MONKEY_PATCH", opts.monkeyPatch, "Monkey patch"); err != nil {
+	if err := applyToggleOverride("TMUXCODER_CLEAN_DEFAULT_ENV_SP", opts.cleanDefaultEnvSP, "Clean default env SP"); err != nil {
 		return err
 	}
 

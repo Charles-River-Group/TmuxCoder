@@ -1,12 +1,12 @@
 {
   "mode": "local",
   "promptProxy": {
-    "enabled": true,
+    "enabled": false,
     "overrideSystem": true,
     "overrideParams": true
   },
   "monkeyPatch": {
-    "enabled": true,
+    "enabled": false,
     "interceptEnvironment": true,
     "interceptCustom": true
   },
