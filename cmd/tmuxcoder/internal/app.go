@@ -659,6 +659,18 @@ func (a *App) startServerProcess(host, port, url string) error {
 	cmd.Stderr = logFile
 	cmd.Env = os.Environ()
 
+	// Add .opencode/node_modules to NODE_PATH so bun can resolve plugin dependencies
+	opencodeNodeModules := filepath.Join(a.projectRoot, ".opencode", "node_modules")
+	if info, err := os.Stat(opencodeNodeModules); err == nil && info.IsDir() {
+		nodePath := os.Getenv("NODE_PATH")
+		if nodePath != "" {
+			nodePath = opencodeNodeModules + string(os.PathListSeparator) + nodePath
+		} else {
+			nodePath = opencodeNodeModules
+		}
+		cmd.Env = append(cmd.Env, "NODE_PATH="+nodePath)
+	}
+
 	if err := cmd.Start(); err != nil {
 		logFile.Close()
 		return fmt.Errorf("failed to start OpenCode server: %w", err)
@@ -673,8 +685,11 @@ func (a *App) startServerProcess(host, port, url string) error {
 
 func (a *App) waitForServerReady(url string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
+	// Use longer timeout for individual health checks to allow server initialization
+	// Server needs time to load plugins, configs, and LSP servers on first request
+	healthCheckTimeout := 5 * time.Second
 	for time.Now().Before(deadline) {
-		if a.serverReachable(url, time.Second) {
+		if a.serverReachable(url, healthCheckTimeout) {
 			return nil
 		}
 		time.Sleep(200 * time.Millisecond)
